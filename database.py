@@ -10,69 +10,82 @@ DB_PATH = os.environ.get('DB_PATH', 'castings.db')
 
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    # timeout=30 → wait up to 30 s if another process holds a write lock
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        pass  # WAL already set, or read-only mount — not fatal
     return conn
 
 
 def init_db():
-    with get_db() as conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS castings (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                description TEXT,
-                source_url TEXT UNIQUE NOT NULL,
-                source_site TEXT,
-                age_min INTEGER,
-                age_max INTEGER,
-                gender TEXT DEFAULT 'any',
-                country TEXT DEFAULT 'CH',
-                deadline TEXT,
-                pdf_urls TEXT DEFAULT '[]',
-                pdf_content TEXT,
-                status TEXT DEFAULT 'new',
-                found_date TEXT,
-                raw_content TEXT,
-                created_at TEXT DEFAULT (datetime('now')),
-                updated_at TEXT DEFAULT (datetime('now'))
-            );
+    import time
+    for attempt in range(5):
+        try:
+            with get_db() as conn:
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS castings (
+                        id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        description TEXT,
+                        source_url TEXT UNIQUE NOT NULL,
+                        source_site TEXT,
+                        age_min INTEGER,
+                        age_max INTEGER,
+                        gender TEXT DEFAULT 'any',
+                        country TEXT DEFAULT 'CH',
+                        deadline TEXT,
+                        pdf_urls TEXT DEFAULT '[]',
+                        pdf_content TEXT,
+                        status TEXT DEFAULT 'new',
+                        found_date TEXT,
+                        raw_content TEXT,
+                        created_at TEXT DEFAULT (datetime('now')),
+                        updated_at TEXT DEFAULT (datetime('now'))
+                    );
 
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
+                    CREATE TABLE IF NOT EXISTS settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    );
 
-            CREATE TABLE IF NOT EXISTS scan_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                started_at TEXT,
-                finished_at TEXT,
-                found INTEGER DEFAULT 0,
-                new_count INTEGER DEFAULT 0,
-                filtered INTEGER DEFAULT 0,
-                errors TEXT DEFAULT '[]',
-                status TEXT DEFAULT 'running'
-            );
-        """)
-        # Insert default settings if not exist
-        defaults = {
-            'actor_name': 'Noam',
-            'actor_age': '14',
-            'actor_languages': '["German", "English", "Japanese", "Swiss German"]',
-            'enabled_countries': '["CH"]',
-            'enabled_sites': '["filmkidsplus.ch", "studentfilm.ch", "ronorp.net", "encast.pro", "swisscasting.ch"]',
-            'de_ecast_only': 'true',
-            'uk_ecast_only': 'true',
-            'scan_hour': '8',
-            'scan_minute': '0',
-        }
-        for key, value in defaults.items():
-            conn.execute(
-                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
-                (key, value)
-            )
-        conn.commit()
+                    CREATE TABLE IF NOT EXISTS scan_log (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        started_at TEXT,
+                        finished_at TEXT,
+                        found INTEGER DEFAULT 0,
+                        new_count INTEGER DEFAULT 0,
+                        filtered INTEGER DEFAULT 0,
+                        errors TEXT DEFAULT '[]',
+                        status TEXT DEFAULT 'running'
+                    );
+                """)
+                # Insert default settings if not exist
+                defaults = {
+                    'actor_name': 'Noam',
+                    'actor_age': '14',
+                    'actor_languages': '["German", "English", "Japanese", "Swiss German"]',
+                    'enabled_countries': '["CH"]',
+                    'enabled_sites': '["filmkidsplus.ch", "studentfilm.ch", "ronorp.net", "encast.pro", "swisscasting.ch"]',
+                    'de_ecast_only': 'true',
+                    'uk_ecast_only': 'true',
+                    'scan_hour': '8',
+                    'scan_minute': '0',
+                }
+                for key, value in defaults.items():
+                    conn.execute(
+                        "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                        (key, value)
+                    )
+                conn.commit()
+            return  # success — exit retry loop
+        except sqlite3.OperationalError as e:
+            if 'locked' in str(e) and attempt < 4:
+                time.sleep(1 + attempt)  # back off and retry
+            else:
+                raise
 
 
 def get_settings():
