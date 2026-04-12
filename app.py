@@ -30,6 +30,17 @@ app.config['JSON_SORT_KEYS'] = False
 scheduler = None
 _scan_lock = threading.Lock()
 _scan_in_progress = False
+_scan_progress = []          # in-memory log lines for the current/last scan
+_scan_progress_lock = threading.Lock()
+
+
+def log_progress(msg: str):
+    """Append a timestamped line to the in-memory scan log."""
+    with _scan_progress_lock:
+        ts = datetime.now().strftime('%H:%M:%S')
+        _scan_progress.append(f"[{ts}] {msg}")
+        if len(_scan_progress) > 200:   # keep last 200 lines
+            _scan_progress.pop(0)
 
 
 def start_scheduler():
@@ -73,36 +84,87 @@ def update_scheduler_time(hour: int, minute: int):
 
 def run_scan_job():
     """The actual scan job (thread-safe)."""
-    global _scan_in_progress
+    global _scan_in_progress, _scan_progress
     with _scan_lock:
         if _scan_in_progress:
             logger.info("Scan already in progress, skipping.")
             return
         _scan_in_progress = True
 
+    # Clear the log for the new scan
+    with _scan_progress_lock:
+        _scan_progress.clear()
+
     try:
-        logger.info("Starting casting scan...")
+        log_progress("🔍 Scan started…")
         settings = db.get_settings()
         log_id = db.start_scan_log()
 
-        castings, stats = run_scrapers(settings)
+        enabled_sites = settings.get('enabled_sites', [])
+        enabled_countries = settings.get('enabled_countries', ['CH'])
+        log_progress(f"🌍 Countries: {', '.join(enabled_countries)}")
+        log_progress(f"🌐 Sites: {', '.join(enabled_sites)}")
 
+        castings_all = []
+        total_stats = {'scraped': 0, 'relevant': 0, 'filtered': 0, 'errors': []}
+
+        for site_name in enabled_sites:
+            scraper_cls = SCRAPER_REGISTRY.get(site_name)
+            if not scraper_cls:
+                continue
+            scraper = scraper_cls(settings)
+            if scraper.country not in enabled_countries:
+                log_progress(f"⏭️  {site_name} — skipped (country {scraper.country} not enabled)")
+                continue
+
+            log_progress(f"🔎 Scraping {site_name}…")
+            try:
+                castings = scraper.scrape()
+                relevant = []
+                filtered = 0
+                for c in castings:
+                    ok, reason = scraper.is_relevant(c)
+                    if ok:
+                        relevant.append(c)
+                    else:
+                        filtered += 1
+                log_progress(f"   ✅ {site_name}: {len(relevant)} relevant, {filtered} filtered out")
+                castings_all.extend(relevant)
+                total_stats['scraped'] += len(castings)
+                total_stats['relevant'] += len(relevant)
+                total_stats['filtered'] += filtered
+            except Exception as e:
+                msg = f"{site_name}: {e}"
+                log_progress(f"   ❌ {site_name}: error — {e}")
+                total_stats['errors'].append(msg)
+
+        # Deduplicate and save
+        seen = set()
         new_count = 0
-        for casting in castings:
+        for casting in castings_all:
+            cid = casting.get('id')
+            if cid in seen:
+                continue
+            seen.add(cid)
             is_new = db.upsert_casting(casting)
             if is_new:
                 new_count += 1
 
-        stats['new'] = new_count
         db.finish_scan_log(
             log_id,
-            found=stats['relevant'],
+            found=total_stats['relevant'],
             new_count=new_count,
-            filtered=stats['filtered'],
-            errors=stats['errors'],
+            filtered=total_stats['filtered'],
+            errors=total_stats['errors'],
         )
-        logger.info(f"Scan done: {new_count} new castings added.")
+
+        log_progress(f"🎉 Done! {new_count} new castings added, {total_stats['filtered']} filtered out.")
+        if total_stats['errors']:
+            log_progress(f"⚠️  {len(total_stats['errors'])} site(s) had errors.")
+        logger.info(f"Scan done: {new_count} new castings.")
+
     except Exception as e:
+        log_progress(f"💥 Scan failed: {e}")
         logger.error(f"Scan job failed: {e}")
     finally:
         with _scan_lock:
@@ -204,6 +266,16 @@ def api_scan_status():
     })
 
 
+@app.route('/api/scan/progress', methods=['GET'])
+def api_scan_progress():
+    """Return in-memory scan log lines."""
+    with _scan_progress_lock:
+        return jsonify({
+            'in_progress': _scan_in_progress,
+            'logs': list(_scan_progress),
+        })
+
+
 # ── API: Stats ────────────────────────────────────────────────────────────────
 
 @app.route('/api/stats', methods=['GET'])
@@ -213,8 +285,9 @@ def api_stats():
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 
-def create_app():
-    db.init_db()
+# ── Initialize on import (runs for both gunicorn and direct python) ───────────
+
+db.init_db()
 start_scheduler()
 
 
