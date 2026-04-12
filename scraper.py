@@ -97,6 +97,26 @@ def extract_age_range(text: str):
         age = int(m.group(1))
         return age, age
 
+    # Altersspanne / Altersangabe ohne Einheit (z.B. "18-40" im Titel oder nach Komma)
+    # Matches bare "X-Y" or "X–Y" where both numbers are plausible ages (5–80)
+    # Use word boundaries so "2024-04" (a year range) doesn't match
+    for m in re.finditer(r'(?<!\d)(\d{1,2})\s*[-–]\s*(\d{1,2})(?!\d)', text_lower):
+        a, b = int(m.group(1)), int(m.group(2))
+        if 5 <= a <= 80 and 5 <= b <= 80 and a < b:
+            return a, b
+
+    # Single age mentioned near casting keywords
+    for m in re.finditer(r'(?<!\d)(\d{1,2})(?!\d)', text_lower):
+        age = int(m.group(1))
+        if 5 <= age <= 80:
+            # Only use if there is a casting keyword nearby (within 60 chars)
+            start = max(0, m.start() - 60)
+            end = min(len(text_lower), m.end() + 60)
+            context = text_lower[start:end]
+            casting_kw = ['actor', 'actress', 'schauspieler', 'darsteller', 'rolle', 'casting', 'audition']
+            if any(kw in context for kw in casting_kw):
+                return age, age
+
     return None, None
 
 
