@@ -215,15 +215,11 @@ def api_stats():
 
 def create_app():
     db.init_db()
-    with app.app_context():
-        start_scheduler()
-    return app
+start_scheduler()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    db.init_db()
-    start_scheduler()
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
