@@ -1003,7 +1003,9 @@ _DASHBOARD_HTML = r"""
         // ─── Lifecycle ────────────────────────────────────────────
 
         async init() {
-          await Promise.all([this.loadCastings(), this.loadStats(), this.loadScanStatus(), this.loadSettings()]);
+          await Promise.all([this.loadCastings(), this.loadStats(), this.loadScanStatus(), this.loadSettings(), this.loadScanLogs()]);
+          // Auto-open log if there are any log lines from a previous scan
+          if (this.scanLogs.length > 0) this.scanLogsOpen = true;
           this.pollScan();
         },
 
