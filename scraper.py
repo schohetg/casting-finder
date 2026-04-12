@@ -154,14 +154,17 @@ GERMAN_MONTHS = {
 
 
 def extract_deadline(text: str):
-    """Try to extract a deadline from text. Returns ISO date string or None."""
+    """
+    Try to extract a deadline from text. Returns ISO date string or None.
+    NOTE: Returns the date even if it is in the past — the caller decides
+    whether to filter it out. This way expired castings are flagged rather
+    than silently shown with 'deadline unknown'.
+    """
     # DD.MM.YYYY
     m = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{4})', text)
     if m:
         try:
-            d = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
-            if d >= date.today():
-                return d.isoformat()
+            return date(int(m.group(3)), int(m.group(2)), int(m.group(1))).isoformat()
         except Exception:
             pass
 
@@ -172,21 +175,18 @@ def extract_deadline(text: str):
         m = re.search(pattern, text_lower)
         if m:
             try:
-                d = date(int(m.group(2)), month_num, int(m.group(1)))
-                if d >= date.today():
-                    return d.isoformat()
+                return date(int(m.group(2)), month_num, int(m.group(1))).isoformat()
             except Exception:
                 pass
 
-    # Look for deadline context keywords then try to parse
+    # Look for deadline context keywords then try dateutil
     deadline_pattern = r'(?:bewerbung|einsendung|deadline|bewerbungsschluss|frist|bis zum?|until)\s*:?\s*(.{5,40})'
     m = re.search(deadline_pattern, text_lower)
     if m and DATEUTIL_SUPPORT:
         snippet = m.group(1).strip()
         try:
             d = dateutil_parser.parse(snippet, dayfirst=True, fuzzy=True)
-            if d.date() >= date.today():
-                return d.date().isoformat()
+            return d.date().isoformat()
         except Exception:
             pass
 
@@ -253,16 +253,37 @@ class BaseScraper:
 
         return True, "OK"
 
+    # Keywords that must appear somewhere in a real casting listing
+    CASTING_KEYWORDS = [
+        'casting', 'schauspieler', 'schauspielerin', 'darsteller', 'darstellerin',
+        'rolle', 'audition', 'bewerbung', 'gesucht', 'actor', 'actress',
+        'film', 'serie', 'theater', 'produktion', 'dreh', 'shoot',
+        'selbstband', 'self-tape', 'e-casting',
+    ]
+
+    def _is_casting_content(self, text: str) -> bool:
+        """Return True only if the text looks like a real casting call."""
+        text_lower = text.lower()
+        return any(kw in text_lower for kw in self.CASTING_KEYWORDS)
+
     def _enrich(self, casting: dict) -> dict:
-        """Fetch detail page + PDFs, add parsed fields."""
+        """
+        Fetch detail page + PDFs, add parsed fields.
+        Returns None if the page is dead (404) or clearly not a casting.
+        """
         url = casting.get('source_url', '')
         description = casting.get('description', '')
         pdf_urls = []
         pdf_content = ''
+        page_ok = False
 
         try:
             resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 404:
+                logger.debug(f"Dead link (404): {url}")
+                return None   # signal caller to skip this casting
             resp.raise_for_status()
+            page_ok = True
             detail = BeautifulSoup(resp.text, 'lxml')
 
             # Find main content block (generic heuristics)
@@ -273,6 +294,8 @@ class BaseScraper:
             )
             if content_el:
                 description = content_el.get_text(separator=' ', strip=True)
+            else:
+                description = detail.get_text(separator=' ', strip=True)[:2000]
 
             pdf_urls = find_pdf_links(detail, url)
             for pu in pdf_urls[:3]:  # limit PDF reads
@@ -283,7 +306,17 @@ class BaseScraper:
         except Exception as e:
             logger.debug(f"Enrichment failed for {url}: {e}")
 
+        # Reject if page didn't load AND we have no description worth using
+        if not page_ok and not description:
+            return None
+
         full_text = f"{casting.get('title', '')} {description} {pdf_content}"
+
+        # Reject if nothing in the content looks like a casting call
+        if not self._is_casting_content(full_text):
+            logger.debug(f"Not a casting (no keywords): {casting.get('title', url)}")
+            return None
+
         casting['description'] = description
         casting['pdf_urls'] = pdf_urls
         casting['pdf_content'] = pdf_content
@@ -344,7 +377,8 @@ class FilmKidsPlusScraper(BaseScraper):
                             'description': article.get_text(separator=' ', strip=True),
                         }
                         casting = self._enrich(casting)
-                        castings.append(casting)
+                        if casting:
+                            castings.append(casting)
                     except Exception as e:
                         logger.debug(f"filmkidsplus article parse error: {e}")
 
@@ -406,7 +440,8 @@ class StudentFilmScraper(BaseScraper):
                             'description': article.get_text(separator=' ', strip=True),
                         }
                         casting = self._enrich(casting)
-                        castings.append(casting)
+                        if casting:
+                            castings.append(casting)
                     except Exception as e:
                         logger.debug(f"studentfilm article error: {e}")
 
@@ -487,7 +522,8 @@ class RonorpScraper(BaseScraper):
                             'description': item.get_text(separator=' ', strip=True),
                         }
                         casting = self._enrich(casting)
-                        castings.append(casting)
+                        if casting:
+                            castings.append(casting)
                     except Exception as e:
                         logger.debug(f"ronorp item error: {e}")
 
@@ -547,7 +583,8 @@ class EnCastScraper(BaseScraper):
                             'description': item.get_text(separator=' ', strip=True),
                         }
                         casting = self._enrich(casting)
-                        castings.append(casting)
+                        if casting:
+                            castings.append(casting)
                     except Exception as e:
                         logger.debug(f"encast item error: {e}")
 
@@ -610,7 +647,8 @@ class SwissCastingScraper(BaseScraper):
                             'description': item.get_text(separator=' ', strip=True),
                         }
                         casting = self._enrich(casting)
-                        castings.append(casting)
+                        if casting:
+                            castings.append(casting)
                     except Exception as e:
                         logger.debug(f"swisscasting item error: {e}")
 
@@ -675,7 +713,8 @@ class CastingNetworkDEScraper(BaseScraper):
                             'description': item.get_text(separator=' ', strip=True),
                         }
                         casting = self._enrich(casting)
-                        castings.append(casting)
+                        if casting:
+                            castings.append(casting)
                     except Exception as e:
                         logger.debug(f"casting-network.de item error: {e}")
 
