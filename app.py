@@ -45,6 +45,9 @@ def log_progress(msg: str):
 
 def start_scheduler():
     global scheduler
+    if scheduler is not None and scheduler.running:
+        logger.info("Scheduler already running — skipping duplicate start")
+        return
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
         from apscheduler.triggers.cron import CronTrigger
