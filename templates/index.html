@@ -511,6 +511,30 @@
     </div>
   </div>
 
+  <!-- ─── Scan Log Panel ────────────────────────────────── -->
+  <div x-show="scanLogs.length > 0 || scanInProgress" style="padding: 0 24px 16px">
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
+      <div
+        style="padding:10px 16px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none"
+        @click="scanLogsOpen = !scanLogsOpen"
+      >
+        <span style="font-size:0.85rem;font-weight:600;display:flex;align-items:center;gap:8px">
+          <span x-show="scanInProgress" class="scan-pulse">⏳</span>
+          <span x-show="!scanInProgress">📋</span>
+          <span x-show="scanInProgress">Scanning in progress…</span>
+          <span x-show="!scanInProgress">Last scan log</span>
+        </span>
+        <span style="color:var(--muted);font-size:0.8rem" x-text="scanLogsOpen ? '▲ Hide' : '▼ Show'"></span>
+      </div>
+      <div x-show="scanLogsOpen" style="border-top:1px solid var(--border);padding:12px 16px;max-height:240px;overflow-y:auto;font-family:monospace;font-size:0.78rem;line-height:1.8;color:var(--muted)">
+        <template x-for="(line, i) in scanLogs" :key="i">
+          <div x-text="line" :style="line.includes('❌') || line.includes('💥') ? 'color:var(--red)' : line.includes('🎉') ? 'color:var(--green)' : line.includes('⚠️') ? 'color:var(--yellow)' : ''"></div>
+        </template>
+        <div x-show="scanInProgress && scanLogs.length === 0" style="color:var(--muted)">Starting…</div>
+      </div>
+    </div>
+  </div>
+
   <!-- ─── Castings grid ──────────────────────────────────── -->
   <div class="grid" x-show="!loading">
 
@@ -766,12 +790,24 @@
         lastScan: null,
         detailCasting: null,
         settingsOpen: false,
-        settings: {},
+        // Pre-initialize arrays so Alpine knows they are arrays before API loads
+        settings: {
+          actor_name: 'Noam',
+          actor_age: 14,
+          actor_languages: [],
+          enabled_countries: [],
+          enabled_sites: [],
+          de_ecast_only: 'true',
+          uk_ecast_only: 'true',
+          scan_hour: 8,
+          scan_minute: 0,
+        },
         allLanguages: ['German', 'Swiss German', 'English', 'Japanese', 'French', 'Italian'],
         allSites: [],
         enabledCountries: ['CH'],
         toasts: [],
-        scanPollInterval: null,
+        scanLogs: [],
+        scanLogsOpen: false,
 
         // ─── Lifecycle ────────────────────────────────────────────
 
@@ -818,10 +854,15 @@
           try {
             const r = await fetch('/api/settings');
             const d = await r.json();
+            // Ensure array fields are real arrays (never strings)
+            const ensureArray = (v) => Array.isArray(v) ? v : (typeof v === 'string' ? JSON.parse(v) : []);
+            d.actor_languages   = ensureArray(d.actor_languages);
+            d.enabled_countries = ensureArray(d.enabled_countries);
+            d.enabled_sites     = ensureArray(d.enabled_sites);
             this.settings = d;
             this.allSites = d.available_sites || [];
             this.enabledCountries = d.enabled_countries || ['CH'];
-          } catch(e) {}
+          } catch(e) { console.error('loadSettings error', e); }
         },
 
         // ─── Actions ──────────────────────────────────────────────
@@ -829,6 +870,8 @@
         async triggerScan() {
           if (this.scanInProgress) return;
           this.scanInProgress = true;
+          this.scanLogs = [];
+          this.scanLogsOpen = true;   // open log panel immediately
           try {
             const r = await fetch('/api/scan', {method: 'POST'});
             const d = await r.json();
@@ -836,6 +879,7 @@
               this.toast('🔍 Scan started…');
             } else {
               this.toast(d.message || 'Scan already running');
+              this.scanInProgress = false;
             }
           } catch(e) {
             this.toast('Failed to start scan');
@@ -902,17 +946,27 @@
         pollScan() {
           setInterval(async () => {
             await this.loadScanStatus();
-            if (!this.scanInProgress) {
-              await this.loadStats();
+            // Poll progress logs while scanning (every 2s effectively via this loop)
+            if (this.scanInProgress || this._wasScanRunning) {
+              await this.loadScanLogs();
             }
             // Refresh castings when scan finishes
             if (!this.scanInProgress && this._wasScanRunning) {
               await this.loadCastings();
               await this.loadStats();
               this.toast('✅ Scan complete! Castings updated.');
+              this.scanLogsOpen = true; // auto-open log panel when done
             }
             this._wasScanRunning = this.scanInProgress;
-          }, 5000);
+          }, 2000);
+        },
+
+        async loadScanLogs() {
+          try {
+            const r = await fetch('/api/scan/progress');
+            const d = await r.json();
+            this.scanLogs = d.logs || [];
+          } catch(e) {}
         },
 
         // ─── Helpers ──────────────────────────────────────────────
@@ -955,4 +1009,3 @@
   </script>
 </body>
 </html>
-
