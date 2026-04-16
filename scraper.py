@@ -692,18 +692,10 @@ class CastingNetworkDEScraper(BaseScraper):
                             link = self.BASE_URL + link
                         if not link.startswith('http'):
                             continue
-
                         title_el = item.find(re.compile(r'^h[1-4]$'))
                         title = title_el.get_text(strip=True) if title_el else link_el.get_text(strip=True)
                         if not title or len(title) < 4:
                             continue
-
-                        item_text = item.get_text().lower()
-                        # Only include if it mentions ecasting/online casting
-                        if 'e-casting' not in item_text and 'online' not in item_text and 'self-tape' not in item_text:
-                            if self.settings.get('de_ecast_only', 'true') == 'true':
-                                continue
-
                         casting = {
                             'id': make_id(link),
                             'title': title,
@@ -717,24 +709,340 @@ class CastingNetworkDEScraper(BaseScraper):
                             castings.append(casting)
                     except Exception as e:
                         logger.debug(f"casting-network.de item error: {e}")
-
                 if castings:
                     break
             except Exception as e:
                 logger.warning(f"casting-network.de error: {e}")
+        return castings
 
+
+# ── castforward.de ────────────────────────────────────────────────────────────
+
+class CastForwardDEScraper(BaseScraper):
+    """castforward.de — large German-language casting platform."""
+    name = 'castforward.de'
+    BASE_URL = 'https://www.castforward.de'
+    country = 'DE'
+    URLS = [
+        'https://www.castforward.de/members/castings/',
+        'https://www.castforward.de/casting/',
+    ]
+
+    def scrape(self) -> list:
+        castings = []
+        for url in self.URLS:
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+                if resp.status_code != 200:
+                    continue
+                soup = BeautifulSoup(resp.text, 'lxml')
+                items = (
+                    soup.find_all('div', class_=re.compile(r'casting|card|item|job', re.I)) or
+                    soup.find_all('article')
+                )
+                for item in items[:25]:
+                    try:
+                        link_el = item.find('a')
+                        if not link_el:
+                            continue
+                        link = link_el.get('href', '')
+                        if link.startswith('/'):
+                            link = self.BASE_URL + link
+                        if not link.startswith('http'):
+                            continue
+                        title_el = item.find(re.compile(r'^h[1-4]$'))
+                        title = title_el.get_text(strip=True) if title_el else link_el.get_text(strip=True)
+                        if not title or len(title) < 4:
+                            continue
+                        casting = {
+                            'id': make_id(link),
+                            'title': title,
+                            'source_url': link,
+                            'source_site': self.name,
+                            'country': self.country,
+                            'description': item.get_text(separator=' ', strip=True),
+                        }
+                        casting = self._enrich(casting)
+                        if casting:
+                            castings.append(casting)
+                    except Exception as e:
+                        logger.debug(f"castforward.de item error: {e}")
+                if castings:
+                    break
+            except Exception as e:
+                logger.warning(f"castforward.de error ({url}): {e}")
+        return castings
+
+
+# ── castingcallpro.com (UK) ───────────────────────────────────────────────────
+
+class CastingCallProScraper(BaseScraper):
+    """castingcallpro.com — major UK casting platform with public listings."""
+    name = 'castingcallpro.com'
+    BASE_URL = 'https://www.castingcallpro.com'
+    country = 'UK'
+    URLS = [
+        'https://www.castingcallpro.com/castings',
+        'https://www.castingcallpro.com/uk/castings',
+        'https://www.castingcallpro.com/castings?type=unpaid',
+    ]
+
+    def scrape(self) -> list:
+        castings = []
+        for url in self.URLS:
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+                if resp.status_code != 200:
+                    continue
+                soup = BeautifulSoup(resp.text, 'lxml')
+                items = (
+                    soup.find_all('div', class_=re.compile(r'casting|card|item|role|job', re.I)) or
+                    soup.find_all('article') or
+                    soup.find_all('li', class_=re.compile(r'casting|item|role', re.I))
+                )
+                for item in items[:25]:
+                    try:
+                        link_el = item.find('a')
+                        if not link_el:
+                            continue
+                        link = link_el.get('href', '')
+                        if link.startswith('/'):
+                            link = self.BASE_URL + link
+                        if not link.startswith('http'):
+                            continue
+                        title_el = item.find(re.compile(r'^h[1-4]$'))
+                        title = title_el.get_text(strip=True) if title_el else link_el.get_text(strip=True)
+                        if not title or len(title) < 4:
+                            continue
+                        casting = {
+                            'id': make_id(link),
+                            'title': title,
+                            'source_url': link,
+                            'source_site': self.name,
+                            'country': self.country,
+                            'description': item.get_text(separator=' ', strip=True),
+                        }
+                        casting = self._enrich(casting)
+                        if casting:
+                            castings.append(casting)
+                    except Exception as e:
+                        logger.debug(f"castingcallpro item error: {e}")
+                if castings:
+                    break
+            except Exception as e:
+                logger.warning(f"castingcallpro.com error ({url}): {e}")
+        return castings
+
+
+# ── mandy.com (UK) ────────────────────────────────────────────────────────────
+
+class MandyScraper(BaseScraper):
+    """mandy.com — UK/international film & TV casting board."""
+    name = 'mandy.com'
+    BASE_URL = 'https://www.mandy.com'
+    country = 'UK'
+    URLS = [
+        'https://www.mandy.com/uk/actor/job-list',
+        'https://www.mandy.com/uk/casting',
+    ]
+
+    def scrape(self) -> list:
+        castings = []
+        for url in self.URLS:
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+                if resp.status_code != 200:
+                    continue
+                soup = BeautifulSoup(resp.text, 'lxml')
+                items = (
+                    soup.find_all('div', class_=re.compile(r'job|casting|card|listing|item', re.I)) or
+                    soup.find_all('article')
+                )
+                for item in items[:25]:
+                    try:
+                        link_el = item.find('a')
+                        if not link_el:
+                            continue
+                        link = link_el.get('href', '')
+                        if link.startswith('/'):
+                            link = self.BASE_URL + link
+                        if not link.startswith('http'):
+                            continue
+                        title_el = item.find(re.compile(r'^h[1-4]$'))
+                        title = title_el.get_text(strip=True) if title_el else link_el.get_text(strip=True)
+                        if not title or len(title) < 4:
+                            continue
+                        casting = {
+                            'id': make_id(link),
+                            'title': title,
+                            'source_url': link,
+                            'source_site': self.name,
+                            'country': self.country,
+                            'description': item.get_text(separator=' ', strip=True),
+                        }
+                        casting = self._enrich(casting)
+                        if casting:
+                            castings.append(casting)
+                    except Exception as e:
+                        logger.debug(f"mandy.com item error: {e}")
+                if castings:
+                    break
+            except Exception as e:
+                logger.warning(f"mandy.com error ({url}): {e}")
+        return castings
+
+
+# ── streetcasting.ch ─────────────────────────────────────────────────────────
+
+class StreetCastingScraper(BaseScraper):
+    """streetcasting.ch — Swiss street casting platform."""
+    name = 'streetcasting.ch'
+    BASE_URL = 'https://www.streetcasting.ch'
+    country = 'CH'
+    URLS = [
+        'https://www.streetcasting.ch/castings/',
+        'https://www.streetcasting.ch/casting/',
+        'https://www.streetcasting.ch/jobs/',
+        'https://www.streetcasting.ch/',
+    ]
+
+    def scrape(self) -> list:
+        castings = []
+        for url in self.URLS:
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+                if resp.status_code != 200:
+                    continue
+                soup = BeautifulSoup(resp.text, 'lxml')
+                items = (
+                    soup.find_all('article') or
+                    soup.find_all('div', class_=re.compile(r'casting|post|item|job|card', re.I)) or
+                    soup.find_all('li', class_=re.compile(r'casting|item|job', re.I))
+                )
+                for item in items[:25]:
+                    try:
+                        link_el = item.find('a')
+                        if not link_el:
+                            continue
+                        link = link_el.get('href', '')
+                        if link.startswith('/'):
+                            link = self.BASE_URL + link
+                        if not link.startswith('http'):
+                            continue
+                        title_el = item.find(re.compile(r'^h[1-4]$'))
+                        title = title_el.get_text(strip=True) if title_el else link_el.get_text(strip=True)
+                        if not title or len(title) < 4:
+                            continue
+                        casting = {
+                            'id': make_id(link),
+                            'title': title,
+                            'source_url': link,
+                            'source_site': self.name,
+                            'country': self.country,
+                            'description': item.get_text(separator=' ', strip=True),
+                        }
+                        casting = self._enrich(casting)
+                        if casting:
+                            castings.append(casting)
+                    except Exception as e:
+                        logger.debug(f"streetcasting.ch item error: {e}")
+                if castings:
+                    break
+            except Exception as e:
+                logger.warning(f"streetcasting.ch error ({url}): {e}")
+        return castings
+
+
+# ── 451.ch ────────────────────────────────────────────────────────────────────
+
+class Casting451Scraper(BaseScraper):
+    """451.ch — Swiss casting and film production platform."""
+    name = '451.ch'
+    BASE_URL = 'https://www.451.ch'
+    country = 'CH'
+    URLS = [
+        'https://www.451.ch/casting/',
+        'https://www.451.ch/castings/',
+        'https://www.451.ch/jobs/',
+        'https://www.451.ch/stellenangebote/',
+        'https://www.451.ch/',
+    ]
+
+    def scrape(self) -> list:
+        castings = []
+        for url in self.URLS:
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+                if resp.status_code != 200:
+                    continue
+                soup = BeautifulSoup(resp.text, 'lxml')
+                items = (
+                    soup.find_all('article') or
+                    soup.find_all('div', class_=re.compile(r'casting|post|item|job|card|entry', re.I)) or
+                    soup.find_all('li', class_=re.compile(r'casting|item|job', re.I))
+                )
+                for item in items[:25]:
+                    try:
+                        link_el = item.find('a')
+                        if not link_el:
+                            continue
+                        link = link_el.get('href', '')
+                        if link.startswith('/'):
+                            link = self.BASE_URL + link
+                        if not link.startswith('http'):
+                            continue
+                        title_el = item.find(re.compile(r'^h[1-4]$'))
+                        title = title_el.get_text(strip=True) if title_el else link_el.get_text(strip=True)
+                        if not title or len(title) < 4:
+                            continue
+                        casting = {
+                            'id': make_id(link),
+                            'title': title,
+                            'source_url': link,
+                            'source_site': self.name,
+                            'country': self.country,
+                            'description': item.get_text(separator=' ', strip=True),
+                        }
+                        casting = self._enrich(casting)
+                        if casting:
+                            castings.append(casting)
+                    except Exception as e:
+                        logger.debug(f"451.ch item error: {e}")
+                if castings:
+                    break
+            except Exception as e:
+                logger.warning(f"451.ch error ({url}): {e}")
         return castings
 
 
 # ── Main runner ───────────────────────────────────────────────────────────────
 
+# Keywords that indicate a casting is open to remote/e-casting applicants
+ECAST_KEYWORDS = [
+    'e-casting', 'ecasting', 'self-tape', 'selftape', 'self tape',
+    'online casting', 'remote', 'worldwide', 'international applicants',
+    'nicht vor ort', 'aus dem ausland', 'videoauftritt', 'videobewerbung',
+    'open to all', 'apply from anywhere',
+]
+
+def _allows_remote(text: str) -> bool:
+    """Return True if the casting text suggests remote/e-casting is accepted."""
+    t = text.lower()
+    return any(kw in t for kw in ECAST_KEYWORDS)
+
+
 SCRAPER_REGISTRY = {
-    'filmkidsplus.ch': FilmKidsPlusScraper,
-    'studentfilm.ch': StudentFilmScraper,
-    'ronorp.net': RonorpScraper,
-    'encast.pro': EnCastScraper,
-    'swisscasting.ch': SwissCastingScraper,
+    'filmkidsplus.ch':    FilmKidsPlusScraper,
+    'studentfilm.ch':     StudentFilmScraper,
+    'ronorp.net':         RonorpScraper,
+    'encast.pro':         EnCastScraper,
+    'swisscasting.ch':    SwissCastingScraper,
+    'streetcasting.ch':   StreetCastingScraper,
+    '451.ch':             Casting451Scraper,
     'casting-network.de': CastingNetworkDEScraper,
+    'castforward.de':     CastForwardDEScraper,
+    'castingcallpro.com': CastingCallProScraper,
+    'mandy.com':          MandyScraper,
 }
 
 
@@ -745,6 +1053,8 @@ def run_scrapers(settings: dict) -> tuple:
     """
     enabled_sites = settings.get('enabled_sites', list(SCRAPER_REGISTRY.keys()))
     enabled_countries = settings.get('enabled_countries', ['CH'])
+    de_ecast_only = settings.get('de_ecast_only', 'true') == 'true'
+    uk_ecast_only = settings.get('uk_ecast_only', 'true') == 'true'
 
     stats = {'scraped': 0, 'relevant': 0, 'filtered': 0, 'errors': []}
     all_castings = []
@@ -774,6 +1084,18 @@ def run_scrapers(settings: dict) -> tuple:
                 if cast_id in seen_ids:
                     continue
                 seen_ids.add(cast_id)
+
+                # E-casting filter: for DE/UK, only include if casting allows remote
+                country = casting.get('country', '')
+                full_text = f"{casting.get('title','')} {casting.get('description','')}"
+                if country == 'DE' and de_ecast_only and not _allows_remote(full_text):
+                    stats['filtered'] += 1
+                    logger.debug(f"  Filtered (DE, no e-casting): {casting.get('title','?')}")
+                    continue
+                if country == 'UK' and uk_ecast_only and not _allows_remote(full_text):
+                    stats['filtered'] += 1
+                    logger.debug(f"  Filtered (UK, no e-casting): {casting.get('title','?')}")
+                    continue
 
                 relevant, reason = scraper.is_relevant(casting)
                 if relevant:
