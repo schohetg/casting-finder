@@ -223,6 +223,57 @@ def find_pdf_links(soup: BeautifulSoup, base_url: str) -> list:
     return [urljoin(base_url, a['href']) for a in pdf_links]
 
 
+# ── URL / title / content filters ────────────────────────────────────────────
+
+# URL path segments that immediately disqualify a link
+_BAD_URL_PATTERNS = re.compile(
+    r'/(join|signup|register|login|kontakt|contact|impressum|datenschutz|'
+    r'privacy|agb|terms|about|ueber-uns|team|newsletter|press|presse|'
+    r'festival|award|news(?!/casting)|blog(?!/casting)|shop|'
+    r'ticketing|veranstaltung|event(?!/casting)|stellenangebot(?!e/casting))|'
+    r'CAST-PREMIUM|members/join|/user-beitraege/festivals',
+    re.I
+)
+
+# The TITLE of a listing must contain at least one of these
+_TITLE_CASTING_KW = re.compile(
+    r'\b(casting|audition|rolle|role|gesucht|schauspieler|darsteller|actor|'
+    r'actress|e-casting|self.?tape|selbstband|bewerbung|besetzung)\b',
+    re.I
+)
+
+# The full page text must contain BOTH a primary AND a secondary marker
+# to be accepted as a genuine open casting call.
+_PRIMARY_KW = [
+    'casting', 'schauspieler', 'schauspielerin', 'darsteller', 'darstellerin',
+    'audition', 'actor', 'actress', 'rolle gesucht', 'role needed',
+]
+_SECONDARY_KW = [
+    # "apply / send" signals
+    'bewerb', 'apply', 'application', 'einsend', 'bewerbung an', 'bewerbung bis',
+    'bewerbungsschluss', 'deadline', 'frist',
+    # "we are looking" signals
+    'gesucht', 'wir suchen', 'looking for', 'we are looking', 'we need',
+    'we\'re looking', 'sought', 'seeking',
+    # explicit open-call signals
+    'open casting', 'offenes casting', 'open call', 'self-tape', 'selbstband',
+    'e-casting', 'online casting',
+]
+
+
+def _is_open_casting(text: str) -> bool:
+    """
+    Two-stage check: text must contain a primary casting keyword AND
+    at least one secondary 'apply / we are looking' marker.
+    Festivals, membership pages, general articles etc. will typically
+    fail the secondary check.
+    """
+    t = text.lower()
+    has_primary   = any(kw in t for kw in _PRIMARY_KW)
+    has_secondary = any(kw in t for kw in _SECONDARY_KW)
+    return has_primary and has_secondary
+
+
 # ── Base scraper ──────────────────────────────────────────────────────────────
 
 class BaseScraper:
@@ -253,52 +304,58 @@ class BaseScraper:
 
         return True, "OK"
 
-    # Keywords that must appear somewhere in a real casting listing
-    CASTING_KEYWORDS = [
-        'casting', 'schauspieler', 'schauspielerin', 'darsteller', 'darstellerin',
-        'rolle', 'audition', 'bewerbung', 'gesucht', 'actor', 'actress',
-        'film', 'serie', 'theater', 'produktion', 'dreh', 'shoot',
-        'selbstband', 'self-tape', 'e-casting',
-    ]
+    @staticmethod
+    def _url_ok(url: str) -> bool:
+        """Return False for URLs that are clearly not casting listings."""
+        return not _BAD_URL_PATTERNS.search(url)
 
-    def _is_casting_content(self, text: str) -> bool:
-        """Return True only if the text looks like a real casting call."""
-        text_lower = text.lower()
-        return any(kw in text_lower for kw in self.CASTING_KEYWORDS)
+    @staticmethod
+    def _title_ok(title: str) -> bool:
+        """Return True only if the title looks like a casting listing."""
+        return bool(_TITLE_CASTING_KW.search(title))
 
     def _enrich(self, casting: dict) -> dict:
         """
-        Fetch detail page + PDFs, add parsed fields.
-        Returns None if the page is dead (404) or clearly not a casting.
+        Fetch detail page + PDFs, validate as open casting, add parsed fields.
+        Returns None if the link is dead, irrelevant, or not an open casting.
         """
-        url = casting.get('source_url', '')
-        description = casting.get('description', '')
-        pdf_urls = []
-        pdf_content = ''
-        page_ok = False
+        url   = casting.get('source_url', '')
+        title = casting.get('title', '')
 
+        # ── Level 1: URL filter (no network request needed) ───────────────────
+        if not self._url_ok(url):
+            logger.debug(f"Bad URL pattern, skipping: {url}")
+            return None
+
+        # ── Level 2: Title filter (no network request needed) ─────────────────
+        if not self._title_ok(title):
+            logger.debug(f"Title not casting-like, skipping: {title!r}")
+            return None
+
+        description = casting.get('description', '')
+        pdf_urls    = []
+        pdf_content = ''
+        page_ok     = False
+
+        # ── Level 3: Fetch detail page ────────────────────────────────────────
         try:
             resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-            if resp.status_code == 404:
-                logger.debug(f"Dead link (404): {url}")
-                return None   # signal caller to skip this casting
+            if resp.status_code in (404, 410):
+                logger.debug(f"Dead link ({resp.status_code}): {url}")
+                return None
             resp.raise_for_status()
             page_ok = True
-            detail = BeautifulSoup(resp.text, 'lxml')
+            detail  = BeautifulSoup(resp.text, 'lxml')
 
-            # Find main content block (generic heuristics)
             content_el = (
                 detail.find('div', class_=re.compile(r'content|entry|article|post-body|description', re.I)) or
                 detail.find('article') or
                 detail.find('main')
             )
-            if content_el:
-                description = content_el.get_text(separator=' ', strip=True)
-            else:
-                description = detail.get_text(separator=' ', strip=True)[:2000]
+            description = (content_el or detail).get_text(separator=' ', strip=True)[:3000]
 
             pdf_urls = find_pdf_links(detail, url)
-            for pu in pdf_urls[:3]:  # limit PDF reads
+            for pu in pdf_urls[:3]:
                 txt = fetch_pdf_text(pu, url)
                 if txt:
                     pdf_content += f'\n--- PDF: {pu} ---\n{txt}'
@@ -306,22 +363,21 @@ class BaseScraper:
         except Exception as e:
             logger.debug(f"Enrichment failed for {url}: {e}")
 
-        # Reject if page didn't load AND we have no description worth using
         if not page_ok and not description:
             return None
 
-        full_text = f"{casting.get('title', '')} {description} {pdf_content}"
+        full_text = f"{title} {description} {pdf_content}"
 
-        # Reject if nothing in the content looks like a casting call
-        if not self._is_casting_content(full_text):
-            logger.debug(f"Not a casting (no keywords): {casting.get('title', url)}")
+        # ── Level 4: Content must look like an open casting call ──────────────
+        if not _is_open_casting(full_text):
+            logger.debug(f"Not an open casting (failed content check): {title!r}")
             return None
 
         casting['description'] = description
-        casting['pdf_urls'] = pdf_urls
+        casting['pdf_urls']    = pdf_urls
         casting['pdf_content'] = pdf_content
         casting['age_min'], casting['age_max'] = extract_age_range(full_text)
-        casting['gender'] = extract_gender(full_text)
+        casting['gender']   = extract_gender(full_text)
         casting['deadline'] = extract_deadline(full_text)
         return casting
 
