@@ -153,6 +153,20 @@ GERMAN_MONTHS = {
 }
 
 
+def extract_url_publish_date(url: str):
+    """
+    Extract the publication date from a WordPress-style URL like
+    /2023/12/04/post-title/. Returns a date object or None.
+    """
+    m = re.search(r'/(\d{4})/(\d{1,2})/(\d{1,2})/', url)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except Exception:
+            pass
+    return None
+
+
 def extract_deadline(text: str):
     """
     Try to extract a deadline from text. Returns ISO date string or None.
@@ -378,7 +392,26 @@ class BaseScraper:
         casting['pdf_content'] = pdf_content
         casting['age_min'], casting['age_max'] = extract_age_range(full_text)
         casting['gender']   = extract_gender(full_text)
-        casting['deadline'] = extract_deadline(full_text)
+
+        deadline = extract_deadline(full_text)
+
+        # ── Fallback: use URL publication date if no deadline found ───────────
+        # WordPress URLs like /2023/12/04/ reveal when the post was published.
+        # Castings posted more than 3 months ago with no known future deadline
+        # are almost certainly expired — mark them with the publish date so the
+        # is_relevant() filter can reject them.
+        if not deadline:
+            pub_date = extract_url_publish_date(url)
+            if pub_date:
+                days_old = (date.today() - pub_date).days
+                if days_old > 90:
+                    deadline = pub_date.isoformat()
+                    logger.debug(
+                        f"Using URL publish date as expired deadline "
+                        f"({pub_date}, {days_old}d old): {title!r}"
+                    )
+
+        casting['deadline'] = deadline
         return casting
 
 
