@@ -1109,75 +1109,232 @@ class Casting451Scraper(BaseScraper):
 class BackstageScraper(BaseScraper):
     """
     backstage.com — major US/UK/international casting platform.
-    We scrape the public casting-calls listings filtered to UK & international.
-    Treated as UK country since most European castings there are UK-based or
-    explicitly open to international applicants.
+
+    Backstage's listing/browse pages are React/Next.js rendered, so a plain
+    HTTP request returns an empty shell with no listings.
+
+    Strategy:
+      1. Use DuckDuckGo HTML search (+ Google fallback) to discover individual
+         casting detail URLs — search engines have already crawled and rendered
+         them, and their snippets contain age/role info.
+      2. Fetch each detail page directly.  Backstage uses Next.js SSR so the
+         initial HTML response typically contains the full role data.
+      3. Merge the search snippet + page text so the open-casting check works
+         even if the page returns minimal content.
     """
     name = 'backstage.com'
     BASE_URL = 'https://www.backstage.com'
     country = 'UK'
-    URLS = [
-        'https://www.backstage.com/casting-calls/?type=acting&location=United+Kingdom',
-        'https://www.backstage.com/casting-calls/?type=acting&location=UK',
-        'https://www.backstage.com/casting-calls/?type=acting',
-        'https://www.backstage.com/casting-calls/',
+
+    # Targeted queries — varied so different casting types surface
+    SEARCH_QUERIES = [
+        'site:backstage.com/casting teen youth child actor UK Europe 2026',
+        'site:backstage.com/casting voiceover animation youth child 2026',
+        'site:backstage.com/casting German Japanese multilingual Europe 2026',
+        'site:backstage.com/casting 13 14 15 16 years old UK Europe 2026',
+        'site:backstage.com/casting open call teen actor UK 2026',
+        'site:backstage.com/casting work from home remote child teen 2026',
     ]
+
+    _SEARCH_HEADERS = {
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/121.0.0.0 Safari/537.36'
+        ),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+    }
 
     def scrape(self) -> list:
         castings = []
-        for url in self.URLS:
+        seen_urls = set()
+
+        for query in self.SEARCH_QUERIES:
             try:
-                resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-                if resp.status_code != 200:
-                    continue
-                soup = BeautifulSoup(resp.text, 'lxml')
+                results = self._search(query)
+                for url, snippet in results:
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
 
-                # Backstage uses article cards or role-card divs
-                items = (
-                    soup.find_all('div', class_=re.compile(r'role|casting|card|job|listing', re.I)) or
-                    soup.find_all('article') or
-                    soup.find_all('li', class_=re.compile(r'role|casting|item', re.I))
-                )
+                    # Only individual casting detail pages (slug-NNN pattern)
+                    if not re.search(r'backstage\.com/casting/[^/?#]+-\d+/?$', url):
+                        continue
 
-                for item in items[:30]:
-                    try:
-                        link_el = item.find('a')
-                        if not link_el:
-                            continue
-                        link = link_el.get('href', '')
-                        if link.startswith('/'):
-                            link = self.BASE_URL + link
-                        if not link.startswith('http'):
-                            continue
-                        # Only follow backstage.com casting detail URLs
-                        if 'backstage.com' not in link:
-                            continue
+                    # Append "Casting" so the title keyword filter always passes
+                    title = self._slug_to_title(url) + ' Casting'
 
-                        title_el = item.find(re.compile(r'^h[1-4]$'))
-                        title = title_el.get_text(strip=True) if title_el else link_el.get_text(strip=True)
-                        if not title or len(title) < 4:
-                            continue
+                    casting = {
+                        'id': make_id(url),
+                        'title': title,
+                        'source_url': url,
+                        'source_site': self.name,
+                        'country': self.country,
+                        'description': snippet,   # search snippet as seed text
+                    }
+                    enriched = self._enrich_backstage(casting)
+                    if enriched:
+                        castings.append(enriched)
+                        logger.info(f"backstage.com found: {enriched['title']}")
 
-                        casting = {
-                            'id': make_id(link),
-                            'title': title,
-                            'source_url': link,
-                            'source_site': self.name,
-                            'country': self.country,
-                            'description': item.get_text(separator=' ', strip=True),
-                        }
-                        casting = self._enrich(casting)
-                        if casting:
-                            castings.append(casting)
-                    except Exception as e:
-                        logger.debug(f"backstage.com item error: {e}")
+                    if len(castings) >= 30:
+                        break
 
-                if castings:
-                    break
             except Exception as e:
-                logger.warning(f"backstage.com error ({url}): {e}")
+                logger.warning(f"backstage.com scrape error for '{query}': {e}")
+
+            if len(castings) >= 30:
+                break
 
         return castings
+
+    # ── custom enrich ─────────────────────────────────────────────────────────
+
+    def _enrich_backstage(self, casting: dict):
+        """
+        Like BaseScraper._enrich() but merges the search engine snippet with
+        the fetched page text, so the open-casting check works even when the
+        live page is partially JS-gated.  Also extracts the real h1 title.
+        """
+        url     = casting['source_url']
+        title   = casting['title']
+        snippet = casting.get('description', '')
+
+        if not self._url_ok(url):
+            return None
+        if not self._title_ok(title):
+            return None
+
+        page_text   = ''
+        pdf_urls    = []
+        pdf_content = ''
+
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            if resp.status_code in (404, 410):
+                return None
+            if resp.status_code == 200:
+                detail = BeautifulSoup(resp.text, 'lxml')
+
+                # Try to grab the real project title from the page
+                h1 = detail.find('h1')
+                if h1:
+                    real_title = h1.get_text(strip=True)
+                    if len(real_title) > 4:
+                        casting['title'] = real_title + ' Casting'
+
+                content_el = (
+                    detail.find('div', class_=re.compile(
+                        r'content|entry|article|post-body|description|role|casting', re.I
+                    )) or
+                    detail.find('article') or
+                    detail.find('main')
+                )
+                page_text = (content_el or detail).get_text(separator=' ', strip=True)[:4000]
+
+                pdf_urls = find_pdf_links(detail, url)
+                for pu in pdf_urls[:3]:
+                    txt = fetch_pdf_text(pu, url)
+                    if txt:
+                        pdf_content += f'\n--- PDF: {pu} ---\n{txt}'
+
+        except Exception as e:
+            logger.debug(f"Backstage detail fetch failed {url}: {e}")
+
+        # Merge: search snippet (already rendered by search engine) + live page text
+        full_text = f"{casting['title']} {snippet} {page_text} {pdf_content}"
+
+        if not full_text.strip():
+            return None
+
+        # Open-casting check — snippet alone is often enough to pass
+        if not _is_open_casting(full_text):
+            # Slightly more lenient for Backstage: if it says "apply" it's a casting
+            if not any(kw in full_text.lower() for kw in ('apply', 'audition', 'seeking', 'sought')):
+                logger.debug(f"Backstage: not open casting: {casting['title']!r}")
+                return None
+
+        casting['description'] = page_text or snippet
+        casting['pdf_urls']    = pdf_urls
+        casting['pdf_content'] = pdf_content
+        casting['age_min'], casting['age_max'] = extract_age_range(full_text)
+        casting['gender']      = extract_gender(full_text)
+        casting['deadline']    = extract_deadline(full_text)
+
+        return casting
+
+    # ── search helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _slug_to_title(url: str) -> str:
+        slug = url.rstrip('/').split('/')[-1]
+        slug = re.sub(r'-\d+$', '', slug)   # strip trailing numeric ID
+        return slug.replace('-', ' ').title()
+
+    def _search(self, query: str) -> list:
+        """DuckDuckGo first, Google as fallback. Returns [(url, snippet), ...]."""
+        results = self._ddg_search(query)
+        if not results:
+            results = self._google_search(query)
+        return results
+
+    def _ddg_search(self, query: str) -> list:
+        """DuckDuckGo HTML endpoint — no JS needed, scraper-friendly."""
+        import urllib.parse as up
+        search_url = 'https://html.duckduckgo.com/html/?q=' + up.quote(query)
+        try:
+            resp = requests.get(search_url, headers=self._SEARCH_HEADERS, timeout=20)
+            if resp.status_code != 200:
+                return []
+            soup = BeautifulSoup(resp.text, 'lxml')
+            results = []
+            for div in soup.find_all('div', class_='result'):
+                a = div.find('a', class_='result__a')
+                if not a:
+                    continue
+                href = a.get('href', '')
+                # DDG wraps the real URL in a redirect
+                parsed = up.urlparse(href)
+                qs     = up.parse_qs(parsed.query)
+                actual = qs.get('uddg', [''])[0] or href
+                actual = up.unquote(actual)
+                if 'backstage.com' not in actual:
+                    continue
+                snip_el = div.find('a', class_='result__snippet')
+                snippet = snip_el.get_text(strip=True) if snip_el else ''
+                results.append((actual, snippet))
+            logger.debug(f"DDG found {len(results)} backstage URLs for: {query}")
+            return results
+        except Exception as e:
+            logger.debug(f"DDG search error: {e}")
+            return []
+
+    def _google_search(self, query: str) -> list:
+        """Google web search as fallback."""
+        import urllib.parse as up
+        search_url = 'https://www.google.com/search?q=' + up.quote(query) + '&num=20&hl=en'
+        try:
+            resp = requests.get(search_url, headers=self._SEARCH_HEADERS, timeout=20)
+            if resp.status_code != 200:
+                return []
+            soup = BeautifulSoup(resp.text, 'lxml')
+            results = []
+            for a in soup.find_all('a', href=True):
+                href = a['href']
+                if not href.startswith('/url?q='):
+                    continue
+                url = up.unquote(href[7:].split('&')[0])
+                if 'backstage.com/casting/' not in url:
+                    continue
+                parent  = a.find_parent(['div', 'li'])
+                snippet = parent.get_text(separator=' ', strip=True)[:400] if parent else ''
+                results.append((url, snippet))
+            logger.debug(f"Google found {len(results)} backstage URLs for: {query}")
+            return results
+        except Exception as e:
+            logger.debug(f"Google search error: {e}")
+            return []
 
 
 # ── Main runner ───────────────────────────────────────────────────────────────
@@ -1185,7 +1342,8 @@ class BackstageScraper(BaseScraper):
 # Keywords that indicate a casting is open to remote/e-casting applicants
 ECAST_KEYWORDS = [
     'e-casting', 'ecasting', 'self-tape', 'selftape', 'self tape',
-    'online casting', 'remote', 'worldwide', 'international applicants',
+    'online casting', 'remote', 'work-from-home', 'work from home',
+    'worldwide', 'international applicants',
     'nicht vor ort', 'aus dem ausland', 'videoauftritt', 'videobewerbung',
     'open to all', 'apply from anywhere',
 ]
