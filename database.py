@@ -68,7 +68,7 @@ def init_db():
                     'actor_age': '14',
                     'actor_languages': '["German", "English", "Japanese", "Swiss German"]',
                     'enabled_countries': '["CH"]',
-                    'enabled_sites': '["filmkidsplus.ch", "studentfilm.ch", "ronorp.net", "encast.pro", "swisscasting.ch", "streetcasting.ch", "451.ch", "casting-network.de", "castforward.de", "castingcallpro.com", "mandy.com"]',
+                    'enabled_sites': '["filmkidsplus.ch", "studentfilm.ch", "ronorp.net", "encast.pro", "swisscasting.ch", "streetcasting.ch", "451.ch", "casting-network.de", "castforward.de", "castingcallpro.com", "mandy.com", "backstage.com"]',
                     'de_ecast_only': 'true',
                     'uk_ecast_only': 'true',
                     'scan_hour': '8',
