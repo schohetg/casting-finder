@@ -1104,6 +1104,82 @@ class Casting451Scraper(BaseScraper):
         return castings
 
 
+# ── backstage.com ────────────────────────────────────────────────────────────
+
+class BackstageScraper(BaseScraper):
+    """
+    backstage.com — major US/UK/international casting platform.
+    We scrape the public casting-calls listings filtered to UK & international.
+    Treated as UK country since most European castings there are UK-based or
+    explicitly open to international applicants.
+    """
+    name = 'backstage.com'
+    BASE_URL = 'https://www.backstage.com'
+    country = 'UK'
+    URLS = [
+        'https://www.backstage.com/casting-calls/?type=acting&location=United+Kingdom',
+        'https://www.backstage.com/casting-calls/?type=acting&location=UK',
+        'https://www.backstage.com/casting-calls/?type=acting',
+        'https://www.backstage.com/casting-calls/',
+    ]
+
+    def scrape(self) -> list:
+        castings = []
+        for url in self.URLS:
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+                if resp.status_code != 200:
+                    continue
+                soup = BeautifulSoup(resp.text, 'lxml')
+
+                # Backstage uses article cards or role-card divs
+                items = (
+                    soup.find_all('div', class_=re.compile(r'role|casting|card|job|listing', re.I)) or
+                    soup.find_all('article') or
+                    soup.find_all('li', class_=re.compile(r'role|casting|item', re.I))
+                )
+
+                for item in items[:30]:
+                    try:
+                        link_el = item.find('a')
+                        if not link_el:
+                            continue
+                        link = link_el.get('href', '')
+                        if link.startswith('/'):
+                            link = self.BASE_URL + link
+                        if not link.startswith('http'):
+                            continue
+                        # Only follow backstage.com casting detail URLs
+                        if 'backstage.com' not in link:
+                            continue
+
+                        title_el = item.find(re.compile(r'^h[1-4]$'))
+                        title = title_el.get_text(strip=True) if title_el else link_el.get_text(strip=True)
+                        if not title or len(title) < 4:
+                            continue
+
+                        casting = {
+                            'id': make_id(link),
+                            'title': title,
+                            'source_url': link,
+                            'source_site': self.name,
+                            'country': self.country,
+                            'description': item.get_text(separator=' ', strip=True),
+                        }
+                        casting = self._enrich(casting)
+                        if casting:
+                            castings.append(casting)
+                    except Exception as e:
+                        logger.debug(f"backstage.com item error: {e}")
+
+                if castings:
+                    break
+            except Exception as e:
+                logger.warning(f"backstage.com error ({url}): {e}")
+
+        return castings
+
+
 # ── Main runner ───────────────────────────────────────────────────────────────
 
 # Keywords that indicate a casting is open to remote/e-casting applicants
@@ -1129,6 +1205,7 @@ SCRAPER_REGISTRY = {
     'streetcasting.ch':   StreetCastingScraper,
     '451.ch':             Casting451Scraper,
     'casting-network.de': CastingNetworkDEScraper,
+    'backstage.com':      BackstageScraper,
     'castforward.de':     CastForwardDEScraper,
     'castingcallpro.com': CastingCallProScraper,
     'mandy.com':          MandyScraper,
