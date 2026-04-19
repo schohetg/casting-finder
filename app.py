@@ -33,14 +33,25 @@ _scan_in_progress = False
 _scan_progress = []          # in-memory log lines for the current/last scan
 _scan_progress_lock = threading.Lock()
 
+# Log file sits on Render's persistent disk next to the DB
+_DB_DIR = os.path.dirname(os.environ.get('DB_PATH', 'castings.db')) or '.'
+_LOG_FILE = os.path.join(_DB_DIR, 'scan.log')
+
 
 def log_progress(msg: str):
-    """Append a timestamped line to the in-memory scan log."""
+    """Append a timestamped line to in-memory list AND the persistent log file."""
+    ts = datetime.now().strftime('%H:%M:%S')
+    line = f"[{ts}] {msg}"
     with _scan_progress_lock:
-        ts = datetime.now().strftime('%H:%M:%S')
-        _scan_progress.append(f"[{ts}] {msg}")
-        if len(_scan_progress) > 200:   # keep last 200 lines
+        _scan_progress.append(line)
+        if len(_scan_progress) > 300:
             _scan_progress.pop(0)
+    # Write to file immediately so logs survive any crash/restart
+    try:
+        with open(_LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
+    except Exception:
+        pass
 
 
 def start_scheduler():
@@ -103,9 +114,14 @@ def run_scan_job():
             return
         _scan_in_progress = True
 
-    # Clear the log for the new scan
+    # Clear the log for the new scan (memory + file)
     with _scan_progress_lock:
         _scan_progress.clear()
+    try:
+        with open(_LOG_FILE, 'w', encoding='utf-8') as f:
+            f.write('')   # truncate
+    except Exception:
+        pass
 
     # Capture scraper-level INFO logs into the progress panel
     _capture = _ProgressCapture(level=logging.INFO)
@@ -187,13 +203,6 @@ def run_scan_job():
         # Remove the progress capture handler
         try:
             _scraper_logger.removeHandler(_capture)
-        except Exception:
-            pass
-        # Persist logs to DB so they survive server restarts
-        try:
-            with _scan_progress_lock:
-                snapshot = list(_scan_progress)
-            db.update_settings({'last_scan_log': json.dumps(snapshot)})
         except Exception:
             pass
         with _scan_lock:
@@ -1331,16 +1340,16 @@ def api_scan_status():
 
 @app.route('/api/scan/progress', methods=['GET'])
 def api_scan_progress():
-    """Return scan log lines (in-memory, or persisted DB copy after restart)."""
+    """Return scan log lines — in-memory, or from persistent log file after restart."""
     with _scan_progress_lock:
         logs = list(_scan_progress)
-    # If nothing in memory (server restarted), load last saved log from DB
+    # If nothing in memory (server restarted), read from the log file on disk
     if not logs:
         try:
-            settings = db.get_settings()
-            stored = settings.get('last_scan_log', '[]')
-            if isinstance(stored, str):
-                logs = json.loads(stored)
+            if os.path.exists(_LOG_FILE):
+                with open(_LOG_FILE, 'r', encoding='utf-8') as f:
+                    logs = [l.rstrip() for l in f.readlines() if l.strip()]
+                logs = logs[-300:]   # cap at 300 lines
         except Exception:
             pass
     return jsonify({
