@@ -1144,11 +1144,12 @@ class BackstageScraper(BaseScraper):
         'https://www.backstage.com/sitemap-0.xml',
     ]
 
-    # News RSS feeds from search engines — these bypass bot detection entirely
+    # News RSS feeds — bypass bot detection, return article URLs we can then scrape
     NEWS_RSS = [
-        'https://news.google.com/rss/search?q=backstage.com+casting+UK&hl=en-GB&gl=GB&ceid=GB:en',
-        'https://news.google.com/rss/search?q=backstage.com+casting+teen+voiceover&hl=en-GB&gl=GB&ceid=GB:en',
-        'https://www.bing.com/news/search?q=backstage.com+casting+UK+teen&format=rss',
+        'https://news.google.com/rss/search?q=backstage+casting+call+UK&hl=en-GB&gl=GB&ceid=GB:en',
+        'https://news.google.com/rss/search?q=backstage+now+casting+UK+Europe&hl=en-GB&gl=GB&ceid=GB:en',
+        'https://news.google.com/rss/search?q=backstage+casting+teen+voiceover+2026&hl=en&gl=US&ceid=US:en',
+        'https://www.bing.com/news/search?q=backstage.com+casting+UK&format=rss',
     ]
 
     # Known "Now Casting" roundup article URLs — always checked.
@@ -1322,7 +1323,8 @@ class BackstageScraper(BaseScraper):
     # ── Article link extraction ───────────────────────────────────────────────
 
     def _extract_casting_links(self, article_url: str) -> set:
-        """Fetch a Backstage magazine article and return all /casting/slug-ID links."""
+        """Fetch a Backstage magazine article and return all /casting/slug-ID links.
+        Tries both regular HTML <a> tags and the __NEXT_DATA__ JSON blob."""
         found = set()
         try:
             resp = requests.get(article_url, headers=self._HDRS, timeout=20)
@@ -1330,15 +1332,53 @@ class BackstageScraper(BaseScraper):
             if resp.status_code != 200:
                 return found
             soup = BeautifulSoup(resp.text, 'lxml')
+
+            # ── Regular HTML links ────────────────────────────────────────────
             for a in soup.find_all('a', href=True):
                 href = a['href']
                 if href.startswith('/'):
                     href = self.BASE_URL + href
                 if self._DETAIL_RE.search(href):
                     found.add(href)
+
+            # ── __NEXT_DATA__ JSON (Next.js SSR data blob) ────────────────────
+            # Backstage embeds all page data here even if the UI is React-rendered
+            next_tag = soup.find('script', id='__NEXT_DATA__')
+            if next_tag and next_tag.string:
+                try:
+                    raw = next_tag.string
+                    logger.info(f"backstage.com: __NEXT_DATA__ found ({len(raw)} chars)")
+                    # Search the raw JSON string for casting URL patterns
+                    for m in re.finditer(r'backstage\.com/casting/([\w%-]+-\d+)', raw):
+                        found.add(f"https://www.backstage.com/casting/{m.group(1)}/")
+                    # Also look for bare slug patterns (relative paths)
+                    try:
+                        data = json.loads(raw)
+                        self._walk_json_for_casting_urls(data, found)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.info(f"backstage.com: __NEXT_DATA__ parse error — {e}")
+
+            logger.info(f"backstage.com: article → {len(found)} casting links")
         except Exception as e:
             logger.info(f"backstage.com: article fetch error — {e}")
         return found
+
+    def _walk_json_for_casting_urls(self, obj, found: set, depth: int = 0):
+        """Recursively walk a JSON structure and collect casting page URLs/slugs."""
+        if depth > 10:
+            return
+        if isinstance(obj, str):
+            if self._DETAIL_RE.search(obj):
+                url = obj if obj.startswith('http') else self.BASE_URL + obj
+                found.add(url)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                self._walk_json_for_casting_urls(v, found, depth + 1)
+        elif isinstance(obj, list):
+            for item in obj:
+                self._walk_json_for_casting_urls(item, found, depth + 1)
 
     # ── Individual casting page enrichment ────────────────────────────────────
 
@@ -1363,18 +1403,41 @@ class BackstageScraper(BaseScraper):
                 return None
             if resp.status_code == 200:
                 detail = BeautifulSoup(resp.text, 'lxml')
-                h1 = detail.find('h1')
-                if h1:
-                    rt = h1.get_text(strip=True)
-                    if len(rt) > 4:
-                        casting['title'] = rt + ' Casting'
-                        logger.info(f"backstage.com: title = {rt!r}")
-                content_el = (
-                    detail.find('div', class_=re.compile(
-                        r'content|entry|article|post-body|description|role|casting', re.I
-                    )) or detail.find('article') or detail.find('main')
-                )
-                page_text = (content_el or detail).get_text(separator=' ', strip=True)[:4000]
+
+                # ── Try __NEXT_DATA__ first — richest source ──────────────────
+                next_tag = detail.find('script', id='__NEXT_DATA__')
+                if next_tag and next_tag.string:
+                    try:
+                        nd = json.loads(next_tag.string)
+                        logger.info(f"backstage.com: __NEXT_DATA__ {len(next_tag.string)} chars")
+                        # Convert to plain text for our extractors
+                        page_text = json.dumps(nd, ensure_ascii=False)[:6000]
+                        # Try to get real title from JSON
+                        pp = nd.get('props', {}).get('pageProps', {})
+                        for key in ('name', 'title', 'projectName', 'heading'):
+                            val = pp.get(key) or pp.get('casting', {}).get(key, '')
+                            if val and len(val) > 4:
+                                casting['title'] = val + ' Casting'
+                                logger.info(f"backstage.com: JSON title = {val!r}")
+                                break
+                    except Exception as e:
+                        logger.info(f"backstage.com: __NEXT_DATA__ detail parse error — {e}")
+
+                # ── Fall back to visible HTML text ────────────────────────────
+                if not page_text:
+                    h1 = detail.find('h1')
+                    if h1:
+                        rt = h1.get_text(strip=True)
+                        if len(rt) > 4:
+                            casting['title'] = rt + ' Casting'
+                            logger.info(f"backstage.com: title = {rt!r}")
+                    content_el = (
+                        detail.find('div', class_=re.compile(
+                            r'content|entry|article|post-body|description|role|casting', re.I
+                        )) or detail.find('article') or detail.find('main')
+                    )
+                    page_text = (content_el or detail).get_text(separator=' ', strip=True)[:4000]
+
                 logger.info(f"backstage.com: page={len(page_text)}ch snippet={len(snippet)}ch")
                 pdf_urls = find_pdf_links(detail, url)
                 for pu in pdf_urls[:3]:
