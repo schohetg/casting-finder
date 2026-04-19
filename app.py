@@ -753,6 +753,33 @@ _DASHBOARD_HTML = r"""
     </div>
   </div>
 
+  <!-- ─── Manual check reminder ───────────────────────────── -->
+  <div style="padding: 0 24px 16px">
+    <div style="background:#1a1d27;border:1px solid #2e3250;border-radius:12px;padding:14px 18px">
+      <div style="font-size:0.82rem;font-weight:600;margin-bottom:8px;color:#e2e8f0">
+        🔍 Also check manually — cannot be auto-scanned:
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px">
+        <a href="https://www.backstage.com/casting/open-casting-calls/teens/" target="_blank"
+           style="background:#21253a;border:1px solid #3b82f6;border-radius:8px;padding:5px 12px;font-size:0.78rem;color:#3b82f6;text-decoration:none">
+          🎬 Backstage — Teens UK
+        </a>
+        <a href="https://www.backstage.com/casting/open-casting-calls/london-uk-kids/" target="_blank"
+           style="background:#21253a;border:1px solid #3b82f6;border-radius:8px;padding:5px 12px;font-size:0.78rem;color:#3b82f6;text-decoration:none">
+          🎬 Backstage — London Kids
+        </a>
+        <a href="https://www.backstage.com/casting/open-casting-calls/teen-young-adult/" target="_blank"
+           style="background:#21253a;border:1px solid #3b82f6;border-radius:8px;padding:5px 12px;font-size:0.78rem;color:#3b82f6;text-decoration:none">
+          🎬 Backstage — Teen/Young Adult
+        </a>
+        <a href="https://www.backstage.com/casting/open-casting-calls/?type=voiceover" target="_blank"
+           style="background:#21253a;border:1px solid #6c63ff;border-radius:8px;padding:5px 12px;font-size:0.78rem;color:#6c63ff;text-decoration:none">
+          🎙️ Backstage — Voiceover
+        </a>
+      </div>
+    </div>
+  </div>
+
   <!-- ─── Castings grid ──────────────────────────────────── -->
   <div class="grid" x-show="!loading">
 
