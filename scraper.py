@@ -1149,10 +1149,14 @@ class BackstageScraper(BaseScraper):
     def scrape(self) -> list:
         castings = []
         seen_urls = set()
+        logger.info(f"backstage.com: starting search across {len(self.SEARCH_QUERIES)} queries")
 
-        for query in self.SEARCH_QUERIES:
+        for qi, query in enumerate(self.SEARCH_QUERIES, 1):
+            logger.info(f"backstage.com: query {qi}/{len(self.SEARCH_QUERIES)}: {query}")
             try:
                 results = self._search(query)
+                logger.info(f"backstage.com: query {qi} returned {len(results)} URLs")
+
                 for url, snippet in results:
                     if url in seen_urls:
                         continue
@@ -1160,8 +1164,10 @@ class BackstageScraper(BaseScraper):
 
                     # Only individual casting detail pages (slug-NNN pattern)
                     if not re.search(r'backstage\.com/casting/[^/?#]+-\d+/?$', url):
+                        logger.info(f"backstage.com: skipping non-detail URL: {url}")
                         continue
 
+                    logger.info(f"backstage.com: processing {url}")
                     # Append "Casting" so the title keyword filter always passes
                     title = self._slug_to_title(url) + ' Casting'
 
@@ -1176,17 +1182,21 @@ class BackstageScraper(BaseScraper):
                     enriched = self._enrich_backstage(casting)
                     if enriched:
                         castings.append(enriched)
-                        logger.info(f"backstage.com found: {enriched['title']}")
+                        age_str = f"{enriched.get('age_min')}-{enriched.get('age_max')}" if enriched.get('age_min') else "age unknown"
+                        logger.info(f"backstage.com ✅ ADDED: {enriched['title']} ({age_str})")
+                    else:
+                        logger.info(f"backstage.com ❌ filtered out: {title}")
 
                     if len(castings) >= 30:
                         break
 
             except Exception as e:
-                logger.warning(f"backstage.com scrape error for '{query}': {e}")
+                logger.warning(f"backstage.com scrape error for query {qi}: {e}")
 
             if len(castings) >= 30:
                 break
 
+        logger.info(f"backstage.com: finished — {len(castings)} castings passed all filters")
         return castings
 
     # ── custom enrich ─────────────────────────────────────────────────────────
@@ -1212,6 +1222,7 @@ class BackstageScraper(BaseScraper):
 
         try:
             resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            logger.info(f"backstage.com: detail page HTTP {resp.status_code} for {url}")
             if resp.status_code in (404, 410):
                 return None
             if resp.status_code == 200:
@@ -1223,6 +1234,7 @@ class BackstageScraper(BaseScraper):
                     real_title = h1.get_text(strip=True)
                     if len(real_title) > 4:
                         casting['title'] = real_title + ' Casting'
+                        logger.info(f"backstage.com: real title = {real_title!r}")
 
                 content_el = (
                     detail.find('div', class_=re.compile(
@@ -1232,6 +1244,7 @@ class BackstageScraper(BaseScraper):
                     detail.find('main')
                 )
                 page_text = (content_el or detail).get_text(separator=' ', strip=True)[:4000]
+                logger.info(f"backstage.com: page text length = {len(page_text)} chars")
 
                 pdf_urls = find_pdf_links(detail, url)
                 for pu in pdf_urls[:3]:
@@ -1240,25 +1253,30 @@ class BackstageScraper(BaseScraper):
                         pdf_content += f'\n--- PDF: {pu} ---\n{txt}'
 
         except Exception as e:
-            logger.debug(f"Backstage detail fetch failed {url}: {e}")
+            logger.info(f"backstage.com: detail fetch error — {e}")
 
         # Merge: search snippet (already rendered by search engine) + live page text
         full_text = f"{casting['title']} {snippet} {page_text} {pdf_content}"
+        logger.info(f"backstage.com: full_text length = {len(full_text)} chars, snippet length = {len(snippet)}")
 
         if not full_text.strip():
+            logger.info(f"backstage.com: no text at all, skipping")
             return None
 
         # Open-casting check — snippet alone is often enough to pass
         if not _is_open_casting(full_text):
             # Slightly more lenient for Backstage: if it says "apply" it's a casting
             if not any(kw in full_text.lower() for kw in ('apply', 'audition', 'seeking', 'sought')):
-                logger.debug(f"Backstage: not open casting: {casting['title']!r}")
+                logger.info(f"backstage.com: failed open-casting check for {casting['title']!r}")
                 return None
+
+        age_min, age_max = extract_age_range(full_text)
+        logger.info(f"backstage.com: age_range={age_min}-{age_max}, gender={extract_gender(full_text)}")
 
         casting['description'] = page_text or snippet
         casting['pdf_urls']    = pdf_urls
         casting['pdf_content'] = pdf_content
-        casting['age_min'], casting['age_max'] = extract_age_range(full_text)
+        casting['age_min'], casting['age_max'] = age_min, age_max
         casting['gender']      = extract_gender(full_text)
         casting['deadline']    = extract_deadline(full_text)
 
@@ -1274,9 +1292,13 @@ class BackstageScraper(BaseScraper):
 
     def _search(self, query: str) -> list:
         """DuckDuckGo first, Google as fallback. Returns [(url, snippet), ...]."""
+        logger.info(f"backstage.com: trying DuckDuckGo…")
         results = self._ddg_search(query)
         if not results:
+            logger.info(f"backstage.com: DDG returned nothing, trying Google…")
             results = self._google_search(query)
+        else:
+            logger.info(f"backstage.com: DDG returned {len(results)} results")
         return results
 
     def _ddg_search(self, query: str) -> list:
