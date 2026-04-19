@@ -85,6 +85,15 @@ def update_scheduler_time(hour: int, minute: int):
         logger.warning(f"Could not update scheduler: {e}")
 
 
+class _ProgressCapture(logging.Handler):
+    """Routes scraper logger.info() lines into the live progress panel."""
+    def emit(self, record):
+        try:
+            log_progress(f"      ↳ {record.getMessage()}")
+        except Exception:
+            pass
+
+
 def run_scan_job():
     """The actual scan job (thread-safe)."""
     global _scan_in_progress, _scan_progress
@@ -97,6 +106,11 @@ def run_scan_job():
     # Clear the log for the new scan
     with _scan_progress_lock:
         _scan_progress.clear()
+
+    # Capture scraper-level INFO logs into the progress panel
+    _capture = _ProgressCapture(level=logging.INFO)
+    _scraper_logger = logging.getLogger('scraper')
+    _scraper_logger.addHandler(_capture)
 
     try:
         log_progress("🔍 Scan started…")
@@ -170,6 +184,18 @@ def run_scan_job():
         log_progress(f"💥 Scan failed: {e}")
         logger.error(f"Scan job failed: {e}")
     finally:
+        # Remove the progress capture handler
+        try:
+            _scraper_logger.removeHandler(_capture)
+        except Exception:
+            pass
+        # Persist logs to DB so they survive server restarts
+        try:
+            with _scan_progress_lock:
+                snapshot = list(_scan_progress)
+            db.update_settings({'last_scan_log': json.dumps(snapshot)})
+        except Exception:
+            pass
         with _scan_lock:
             _scan_in_progress = False
 
@@ -694,7 +720,7 @@ _DASHBOARD_HTML = r"""
   </div>
 
   <!-- ─── Scan Log Panel ────────────────────────────────── -->
-  <div x-show="scanLogs.length > 0 || scanInProgress" style="padding: 0 24px 16px">
+  <div style="padding: 0 24px 16px">
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
       <div
         style="padding:10px 16px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none"
@@ -704,15 +730,16 @@ _DASHBOARD_HTML = r"""
           <span x-show="scanInProgress" class="scan-pulse">⏳</span>
           <span x-show="!scanInProgress">📋</span>
           <span x-show="scanInProgress">Scanning in progress…</span>
-          <span x-show="!scanInProgress">Last scan log</span>
+          <span x-show="!scanInProgress" x-text="scanLogs.length > 0 ? 'Last scan log' : 'Scan log (no scans yet)'"></span>
         </span>
         <span style="color:var(--muted);font-size:0.8rem" x-text="scanLogsOpen ? '▲ Hide' : '▼ Show'"></span>
       </div>
-      <div x-show="scanLogsOpen" style="border-top:1px solid var(--border);padding:12px 16px;max-height:240px;overflow-y:auto;font-family:monospace;font-size:0.78rem;line-height:1.8;color:var(--muted)">
+      <div x-show="scanLogsOpen" style="border-top:1px solid var(--border);padding:12px 16px;max-height:300px;overflow-y:auto;font-family:monospace;font-size:0.78rem;line-height:1.8;color:var(--muted)" x-ref="logPanel">
         <template x-for="(line, i) in scanLogs" :key="i">
-          <div x-text="line" :style="line.includes('❌') || line.includes('💥') ? 'color:var(--red)' : line.includes('🎉') ? 'color:var(--green)' : line.includes('⚠️') ? 'color:var(--yellow)' : ''"></div>
+          <div x-text="line" :style="line.includes('❌') || line.includes('💥') ? 'color:var(--red)' : line.includes('🎉') ? 'color:var(--green)' : line.includes('⚠️') ? 'color:var(--yellow)' : line.includes('↳') ? 'color:#6b7280;font-size:0.72rem' : ''"></div>
         </template>
         <div x-show="scanInProgress && scanLogs.length === 0" style="color:var(--muted)">Starting…</div>
+        <div x-show="!scanInProgress && scanLogs.length === 0" style="color:var(--muted)">No scans have run yet. Click <strong>Scan Now</strong> to start.</div>
       </div>
     </div>
   </div>
@@ -998,14 +1025,13 @@ _DASHBOARD_HTML = r"""
         enabledCountries: ['CH'],
         toasts: [],
         scanLogs: [],
-        scanLogsOpen: false,
+        scanLogsOpen: true,   // always open by default
+        _wasScanRunning: false,
 
         // ─── Lifecycle ────────────────────────────────────────────
 
         async init() {
           await Promise.all([this.loadCastings(), this.loadStats(), this.loadScanStatus(), this.loadSettings(), this.loadScanLogs()]);
-          // Auto-open log if there are any log lines from a previous scan
-          if (this.scanLogs.length > 0) this.scanLogsOpen = true;
           this.pollScan();
         },
 
@@ -1139,16 +1165,21 @@ _DASHBOARD_HTML = r"""
         pollScan() {
           setInterval(async () => {
             await this.loadScanStatus();
-            // Poll progress logs while scanning (every 2s effectively via this loop)
+            // Always load logs while scanning or right after scan finishes
             if (this.scanInProgress || this._wasScanRunning) {
               await this.loadScanLogs();
+              // Auto-scroll log panel to bottom
+              this.$nextTick(() => {
+                const el = this.$refs.logPanel;
+                if (el) el.scrollTop = el.scrollHeight;
+              });
             }
             // Refresh castings when scan finishes
             if (!this.scanInProgress && this._wasScanRunning) {
+              await this.loadScanLogs();  // one final load to get complete log
               await this.loadCastings();
               await this.loadStats();
               this.toast('✅ Scan complete! Castings updated.');
-              this.scanLogsOpen = true; // auto-open log panel when done
             }
             this._wasScanRunning = this.scanInProgress;
           }, 2000);
@@ -1300,12 +1331,22 @@ def api_scan_status():
 
 @app.route('/api/scan/progress', methods=['GET'])
 def api_scan_progress():
-    """Return in-memory scan log lines."""
+    """Return scan log lines (in-memory, or persisted DB copy after restart)."""
     with _scan_progress_lock:
-        return jsonify({
-            'in_progress': _scan_in_progress,
-            'logs': list(_scan_progress),
-        })
+        logs = list(_scan_progress)
+    # If nothing in memory (server restarted), load last saved log from DB
+    if not logs:
+        try:
+            settings = db.get_settings()
+            stored = settings.get('last_scan_log', '[]')
+            if isinstance(stored, str):
+                logs = json.loads(stored)
+        except Exception:
+            pass
+    return jsonify({
+        'in_progress': _scan_in_progress,
+        'logs': logs,
+    })
 
 
 # ── API: Stats ────────────────────────────────────────────────────────────────
