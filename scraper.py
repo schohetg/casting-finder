@@ -1126,6 +1126,26 @@ class BackstageScraper(BaseScraper):
     BASE_URL = 'https://www.backstage.com'
     country = 'UK'
 
+    # Backstage uses Cloudflare and returns HTTP 403 to all datacenter IPs
+    # (RSS, sitemaps, article pages, casting pages — all blocked).
+    # Automated scraping is not possible without a paid residential proxy.
+    # The scraper logs a helpful reminder and returns nothing so scan time
+    # is not wasted on repeated 403 requests.
+    MANUAL_LINKS = [
+        ('Teens casting calls', 'https://www.backstage.com/casting/open-casting-calls/teens/'),
+        ('London / UK kids casting', 'https://www.backstage.com/casting/open-casting-calls/london-uk-kids/'),
+        ('Voiceover / animation', 'https://www.backstage.com/casting/open-casting-calls/?type=voiceover'),
+        ('Teen young adult', 'https://www.backstage.com/casting/open-casting-calls/teen-young-adult/'),
+    ]
+
+    def scrape(self) -> list:
+        logger.info("backstage.com: ⚠️  Backstage blocks all server-IP requests (HTTP 403).")
+        logger.info("backstage.com: Automated scraping is not possible without a paid proxy.")
+        logger.info("backstage.com: ➡️  Please check manually at backstage.com/casting/open-casting-calls/teens/")
+        return []
+
+    # ── stubs so the registry entry still works cleanly ──────────────────────
+
     # Regex that matches individual casting detail pages
     _DETAIL_RE = re.compile(r'backstage\.com/casting/[\w%-]+-\d+/?$')
 
