@@ -1110,33 +1110,44 @@ class BackstageScraper(BaseScraper):
     """
     backstage.com — major US/UK/international casting platform.
 
-    Backstage's listing/browse pages are React/Next.js rendered, so a plain
-    HTTP request returns an empty shell with no listings.
+    Three independent discovery strategies (each is tried; results are merged):
 
-    Strategy:
-      1. Use DuckDuckGo HTML search (+ Google fallback) to discover individual
-         casting detail URLs — search engines have already crawled and rendered
-         them, and their snippets contain age/role info.
-      2. Fetch each detail page directly.  Backstage uses Next.js SSR so the
-         initial HTML response typically contains the full role data.
-      3. Merge the search snippet + page text so the open-casting check works
-         even if the page returns minimal content.
+    1. XML Sitemap  — Backstage publishes sitemaps listing all /casting/ URLs.
+                      Parse to find recently-added casting pages.
+    2. Magazine articles — Backstage publishes "Now Casting" roundup articles at
+                      /magazine/article/...  These ARE server-side rendered (no JS
+                      needed). Fetch them and extract /casting/slug-ID links.
+    3. Search engines — DuckDuckGo HTML endpoint, then Bing, then Google as
+                      successive fallbacks.
+
+    Individual /casting/slug-ID/ pages use Next.js SSR and return full HTML.
     """
     name = 'backstage.com'
     BASE_URL = 'https://www.backstage.com'
     country = 'UK'
 
-    # Targeted queries — varied so different casting types surface
-    SEARCH_QUERIES = [
-        'site:backstage.com/casting teen youth child actor UK Europe 2026',
-        'site:backstage.com/casting voiceover animation youth child 2026',
-        'site:backstage.com/casting German Japanese multilingual Europe 2026',
-        'site:backstage.com/casting 13 14 15 16 years old UK Europe 2026',
-        'site:backstage.com/casting open call teen actor UK 2026',
-        'site:backstage.com/casting work from home remote child teen 2026',
+    # Magazine roundup articles list current castings and ARE server-side rendered
+    ARTICLE_SEARCH_QUERIES = [
+        'site:backstage.com/magazine now casting UK Europe 2026',
+        'site:backstage.com/magazine animation voiceover teen child UK 2026',
+        'site:backstage.com/magazine casting calls UK Europe 2026',
     ]
 
-    _SEARCH_HEADERS = {
+    # Direct casting page queries (fallback)
+    CASTING_SEARCH_QUERIES = [
+        'backstage.com/casting teen youth child actor UK Europe 2026',
+        'backstage.com/casting voiceover animation youth 2026',
+        'backstage.com/casting 13 14 15 16 years UK Europe 2026',
+    ]
+
+    # Sitemaps to try
+    SITEMAP_URLS = [
+        'https://www.backstage.com/sitemap.xml',
+        'https://www.backstage.com/sitemap_index.xml',
+        'https://www.backstage.com/sitemap-0.xml',
+    ]
+
+    _HDRS = {
         'User-Agent': (
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
             'AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -1146,67 +1157,234 @@ class BackstageScraper(BaseScraper):
         'Accept-Language': 'en-US,en;q=0.9',
     }
 
+    # Regex that matches individual casting detail pages
+    _DETAIL_RE = re.compile(r'backstage\.com/casting/[\w%-]+-\d+/?$')
+
+    # ── main entry point ──────────────────────────────────────────────────────
+
     def scrape(self) -> list:
+        casting_urls: dict = {}   # url → snippet (snippet may be empty string)
+
+        # ── Strategy 1: XML sitemaps ─────────────────────────────────────────
+        logger.info("backstage.com: Strategy 1 — checking XML sitemaps")
+        sm_urls = self._sitemap_urls()
+        logger.info(f"backstage.com: sitemap yielded {len(sm_urls)} casting URLs")
+        for u in sm_urls:
+            casting_urls.setdefault(u, '')
+
+        # ── Strategy 2: Magazine roundup articles ────────────────────────────
+        logger.info("backstage.com: Strategy 2 — magazine article search")
+        article_urls = set()
+        for query in self.ARTICLE_SEARCH_QUERIES:
+            found = self._search_urls(query, pattern=r'backstage\.com/magazine/article/')
+            logger.info(f"backstage.com: article query '{query[:50]}' → {len(found)} articles")
+            article_urls.update(found)
+
+        logger.info(f"backstage.com: fetching {len(article_urls)} article pages for casting links")
+        for art_url in list(article_urls)[:10]:
+            links = self._extract_casting_links_from_article(art_url)
+            logger.info(f"backstage.com: article → {len(links)} casting links: {art_url}")
+            for u in links:
+                casting_urls.setdefault(u, '')
+
+        # ── Strategy 3: Search engines for casting pages directly ────────────
+        logger.info("backstage.com: Strategy 3 — direct casting search")
+        for query in self.CASTING_SEARCH_QUERIES:
+            found = self._search_urls_with_snippets(query, pattern=self._DETAIL_RE)
+            logger.info(f"backstage.com: casting query '{query[:50]}' → {len(found)} URLs")
+            for u, snip in found:
+                casting_urls.setdefault(u, snip or '')
+
+        logger.info(f"backstage.com: total unique casting URLs to process: {len(casting_urls)}")
+
+        # ── Process every discovered URL ─────────────────────────────────────
         castings = []
-        seen_urls = set()
-        logger.info(f"backstage.com: starting search across {len(self.SEARCH_QUERIES)} queries")
-
-        for qi, query in enumerate(self.SEARCH_QUERIES, 1):
-            logger.info(f"backstage.com: query {qi}/{len(self.SEARCH_QUERIES)}: {query}")
-            try:
-                results = self._search(query)
-                logger.info(f"backstage.com: query {qi} returned {len(results)} URLs")
-
-                for url, snippet in results:
-                    if url in seen_urls:
-                        continue
-                    seen_urls.add(url)
-
-                    # Only individual casting detail pages (slug-NNN pattern)
-                    if not re.search(r'backstage\.com/casting/[^/?#]+-\d+/?$', url):
-                        logger.info(f"backstage.com: skipping non-detail URL: {url}")
-                        continue
-
-                    logger.info(f"backstage.com: processing {url}")
-                    # Append "Casting" so the title keyword filter always passes
-                    title = self._slug_to_title(url) + ' Casting'
-
-                    casting = {
-                        'id': make_id(url),
-                        'title': title,
-                        'source_url': url,
-                        'source_site': self.name,
-                        'country': self.country,
-                        'description': snippet,   # search snippet as seed text
-                    }
-                    enriched = self._enrich_backstage(casting)
-                    if enriched:
-                        castings.append(enriched)
-                        age_str = f"{enriched.get('age_min')}-{enriched.get('age_max')}" if enriched.get('age_min') else "age unknown"
-                        logger.info(f"backstage.com ✅ ADDED: {enriched['title']} ({age_str})")
-                    else:
-                        logger.info(f"backstage.com ❌ filtered out: {title}")
-
-                    if len(castings) >= 30:
-                        break
-
-            except Exception as e:
-                logger.warning(f"backstage.com scrape error for query {qi}: {e}")
+        for url, snippet in casting_urls.items():
+            title = self._slug_to_title(url) + ' Casting'
+            casting = {
+                'id': make_id(url),
+                'title': title,
+                'source_url': url,
+                'source_site': self.name,
+                'country': self.country,
+                'description': snippet,
+            }
+            logger.info(f"backstage.com: processing {url}")
+            enriched = self._enrich_backstage(casting)
+            if enriched:
+                age_str = (f"{enriched['age_min']}-{enriched['age_max']}"
+                           if enriched.get('age_min') is not None else "age unknown")
+                logger.info(f"backstage.com ✅ ADDED: {enriched['title']} ({age_str})")
+                castings.append(enriched)
+            else:
+                logger.info(f"backstage.com ❌ filtered: {title}")
 
             if len(castings) >= 30:
                 break
 
-        logger.info(f"backstage.com: finished — {len(castings)} castings passed all filters")
+        logger.info(f"backstage.com: done — {len(castings)} castings passed all filters")
         return castings
 
-    # ── custom enrich ─────────────────────────────────────────────────────────
+    # ── Strategy 1: sitemaps ──────────────────────────────────────────────────
+
+    def _sitemap_urls(self) -> set:
+        """Parse Backstage XML sitemaps and return /casting/slug-ID/ URLs."""
+        import urllib.parse as up
+        found = set()
+        for sm_url in self.SITEMAP_URLS:
+            try:
+                resp = requests.get(sm_url, headers=self._HDRS, timeout=20)
+                logger.info(f"backstage.com: sitemap {sm_url} → HTTP {resp.status_code}")
+                if resp.status_code != 200:
+                    continue
+                # Parse XML — find all <loc> tags
+                soup = BeautifulSoup(resp.text, 'lxml')
+                locs = soup.find_all('loc')
+                logger.info(f"backstage.com: sitemap has {len(locs)} <loc> entries")
+                for loc in locs:
+                    url = loc.get_text(strip=True)
+                    if self._DETAIL_RE.search(url):
+                        found.add(url)
+                    elif 'sitemap' in url.lower():
+                        # Sub-sitemap index — fetch it too
+                        try:
+                            r2 = requests.get(url, headers=self._HDRS, timeout=15)
+                            if r2.status_code == 200:
+                                s2 = BeautifulSoup(r2.text, 'lxml')
+                                for loc2 in s2.find_all('loc'):
+                                    u2 = loc2.get_text(strip=True)
+                                    if self._DETAIL_RE.search(u2):
+                                        found.add(u2)
+                        except Exception:
+                            pass
+                if found:
+                    break   # got something from this sitemap, skip the others
+            except Exception as e:
+                logger.info(f"backstage.com: sitemap error {sm_url} — {e}")
+        return found
+
+    # ── Strategy 2: magazine articles ────────────────────────────────────────
+
+    def _extract_casting_links_from_article(self, article_url: str) -> set:
+        """Fetch a Backstage magazine article page and extract /casting/ links."""
+        found = set()
+        try:
+            resp = requests.get(article_url, headers=self._HDRS, timeout=20)
+            logger.info(f"backstage.com: article HTTP {resp.status_code} — {article_url}")
+            if resp.status_code != 200:
+                return found
+            soup = BeautifulSoup(resp.text, 'lxml')
+            for a in soup.find_all('a', href=True):
+                href = a['href']
+                if href.startswith('/'):
+                    href = self.BASE_URL + href
+                if self._DETAIL_RE.search(href):
+                    found.add(href)
+        except Exception as e:
+            logger.info(f"backstage.com: article fetch error — {e}")
+        return found
+
+    # ── Strategy 3 helpers: search engines ───────────────────────────────────
+
+    def _search_urls(self, query: str, pattern: str) -> set:
+        """Search DDG/Bing/Google and return URLs matching pattern (no snippets)."""
+        results = self._search_with_snippets(query)
+        pat = re.compile(pattern)
+        return {url for url, _ in results if pat.search(url)}
+
+    def _search_urls_with_snippets(self, query: str, pattern) -> list:
+        """Search and return [(url, snippet)] matching the given compiled pattern."""
+        results = self._search_with_snippets(query)
+        return [(url, snip) for url, snip in results if pattern.search(url)]
+
+    def _search_with_snippets(self, query: str) -> list:
+        """Try DDG → Bing → Google, return first non-empty [(url, snippet)]."""
+        for engine_fn, name in [
+            (self._ddg,    'DuckDuckGo'),
+            (self._bing,   'Bing'),
+            (self._google, 'Google'),
+        ]:
+            logger.info(f"backstage.com: searching {name} for: {query[:60]}")
+            try:
+                results = engine_fn(query)
+                logger.info(f"backstage.com: {name} returned {len(results)} results")
+                if results:
+                    return results
+            except Exception as e:
+                logger.info(f"backstage.com: {name} error — {e}")
+        return []
+
+    def _ddg(self, query: str) -> list:
+        import urllib.parse as up
+        url = 'https://html.duckduckgo.com/html/?q=' + up.quote(query)
+        resp = requests.get(url, headers=self._HDRS, timeout=20)
+        logger.info(f"backstage.com: DDG HTTP {resp.status_code}")
+        if resp.status_code != 200:
+            return []
+        soup = BeautifulSoup(resp.text, 'lxml')
+        results = []
+        for div in soup.find_all('div', class_='result'):
+            a = div.find('a', class_='result__a')
+            if not a:
+                continue
+            href = a.get('href', '')
+            parsed = up.urlparse(href)
+            qs = up.parse_qs(parsed.query)
+            actual = qs.get('uddg', [''])[0] or href
+            actual = up.unquote(actual)
+            if 'backstage.com' not in actual:
+                continue
+            snip_el = div.find('a', class_='result__snippet')
+            snippet = snip_el.get_text(strip=True) if snip_el else ''
+            results.append((actual, snippet))
+        return results
+
+    def _bing(self, query: str) -> list:
+        import urllib.parse as up
+        url = 'https://www.bing.com/search?q=' + up.quote(query) + '&count=20'
+        resp = requests.get(url, headers=self._HDRS, timeout=20)
+        logger.info(f"backstage.com: Bing HTTP {resp.status_code}")
+        if resp.status_code != 200:
+            return []
+        soup = BeautifulSoup(resp.text, 'lxml')
+        results = []
+        for li in soup.find_all('li', class_='b_algo'):
+            a = li.find('a', href=True)
+            if not a:
+                continue
+            href = a['href']
+            if 'backstage.com' not in href:
+                continue
+            snip_el = li.find('p') or li.find('div', class_='b_caption')
+            snippet = snip_el.get_text(strip=True) if snip_el else ''
+            results.append((href, snippet))
+        return results
+
+    def _google(self, query: str) -> list:
+        import urllib.parse as up
+        url = 'https://www.google.com/search?q=' + up.quote(query) + '&num=20&hl=en'
+        resp = requests.get(url, headers=self._HDRS, timeout=20)
+        logger.info(f"backstage.com: Google HTTP {resp.status_code}")
+        if resp.status_code != 200:
+            return []
+        soup = BeautifulSoup(resp.text, 'lxml')
+        results = []
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            if not href.startswith('/url?q='):
+                continue
+            actual = up.unquote(href[7:].split('&')[0])
+            if 'backstage.com' not in actual:
+                continue
+            parent = a.find_parent(['div', 'li'])
+            snippet = parent.get_text(separator=' ', strip=True)[:400] if parent else ''
+            results.append((actual, snippet))
+        return results
+
+    # ── enrich individual casting pages ───────────────────────────────────────
 
     def _enrich_backstage(self, casting: dict):
-        """
-        Like BaseScraper._enrich() but merges the search engine snippet with
-        the fetched page text, so the open-casting check works even when the
-        live page is partially JS-gated.  Also extracts the real h1 title.
-        """
+        """Fetch a Backstage casting detail page and extract role data."""
         url     = casting['source_url']
         title   = casting['title']
         snippet = casting.get('description', '')
@@ -1222,141 +1400,62 @@ class BackstageScraper(BaseScraper):
 
         try:
             resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-            logger.info(f"backstage.com: detail page HTTP {resp.status_code} for {url}")
+            logger.info(f"backstage.com: detail HTTP {resp.status_code} — {url}")
             if resp.status_code in (404, 410):
                 return None
             if resp.status_code == 200:
                 detail = BeautifulSoup(resp.text, 'lxml')
 
-                # Try to grab the real project title from the page
+                # Real title from h1
                 h1 = detail.find('h1')
                 if h1:
-                    real_title = h1.get_text(strip=True)
-                    if len(real_title) > 4:
-                        casting['title'] = real_title + ' Casting'
-                        logger.info(f"backstage.com: real title = {real_title!r}")
+                    rt = h1.get_text(strip=True)
+                    if len(rt) > 4:
+                        casting['title'] = rt + ' Casting'
+                        logger.info(f"backstage.com: title = {rt!r}")
 
                 content_el = (
                     detail.find('div', class_=re.compile(
                         r'content|entry|article|post-body|description|role|casting', re.I
-                    )) or
-                    detail.find('article') or
-                    detail.find('main')
+                    )) or detail.find('article') or detail.find('main')
                 )
                 page_text = (content_el or detail).get_text(separator=' ', strip=True)[:4000]
-                logger.info(f"backstage.com: page text length = {len(page_text)} chars")
+                logger.info(f"backstage.com: page_text={len(page_text)} chars, snippet={len(snippet)} chars")
 
                 pdf_urls = find_pdf_links(detail, url)
                 for pu in pdf_urls[:3]:
                     txt = fetch_pdf_text(pu, url)
                     if txt:
                         pdf_content += f'\n--- PDF: {pu} ---\n{txt}'
-
         except Exception as e:
             logger.info(f"backstage.com: detail fetch error — {e}")
 
-        # Merge: search snippet (already rendered by search engine) + live page text
         full_text = f"{casting['title']} {snippet} {page_text} {pdf_content}"
-        logger.info(f"backstage.com: full_text length = {len(full_text)} chars, snippet length = {len(snippet)}")
 
         if not full_text.strip():
-            logger.info(f"backstage.com: no text at all, skipping")
             return None
 
-        # Open-casting check — snippet alone is often enough to pass
         if not _is_open_casting(full_text):
-            # Slightly more lenient for Backstage: if it says "apply" it's a casting
             if not any(kw in full_text.lower() for kw in ('apply', 'audition', 'seeking', 'sought')):
-                logger.info(f"backstage.com: failed open-casting check for {casting['title']!r}")
+                logger.info(f"backstage.com: failed open-casting check: {casting['title']!r}")
                 return None
 
         age_min, age_max = extract_age_range(full_text)
-        logger.info(f"backstage.com: age_range={age_min}-{age_max}, gender={extract_gender(full_text)}")
+        logger.info(f"backstage.com: age={age_min}-{age_max} gender={extract_gender(full_text)}")
 
         casting['description'] = page_text or snippet
         casting['pdf_urls']    = pdf_urls
         casting['pdf_content'] = pdf_content
         casting['age_min'], casting['age_max'] = age_min, age_max
-        casting['gender']      = extract_gender(full_text)
-        casting['deadline']    = extract_deadline(full_text)
-
+        casting['gender']   = extract_gender(full_text)
+        casting['deadline'] = extract_deadline(full_text)
         return casting
-
-    # ── search helpers ────────────────────────────────────────────────────────
 
     @staticmethod
     def _slug_to_title(url: str) -> str:
         slug = url.rstrip('/').split('/')[-1]
-        slug = re.sub(r'-\d+$', '', slug)   # strip trailing numeric ID
+        slug = re.sub(r'-\d+$', '', slug)
         return slug.replace('-', ' ').title()
-
-    def _search(self, query: str) -> list:
-        """DuckDuckGo first, Google as fallback. Returns [(url, snippet), ...]."""
-        logger.info(f"backstage.com: trying DuckDuckGo…")
-        results = self._ddg_search(query)
-        if not results:
-            logger.info(f"backstage.com: DDG returned nothing, trying Google…")
-            results = self._google_search(query)
-        else:
-            logger.info(f"backstage.com: DDG returned {len(results)} results")
-        return results
-
-    def _ddg_search(self, query: str) -> list:
-        """DuckDuckGo HTML endpoint — no JS needed, scraper-friendly."""
-        import urllib.parse as up
-        search_url = 'https://html.duckduckgo.com/html/?q=' + up.quote(query)
-        try:
-            resp = requests.get(search_url, headers=self._SEARCH_HEADERS, timeout=20)
-            if resp.status_code != 200:
-                return []
-            soup = BeautifulSoup(resp.text, 'lxml')
-            results = []
-            for div in soup.find_all('div', class_='result'):
-                a = div.find('a', class_='result__a')
-                if not a:
-                    continue
-                href = a.get('href', '')
-                # DDG wraps the real URL in a redirect
-                parsed = up.urlparse(href)
-                qs     = up.parse_qs(parsed.query)
-                actual = qs.get('uddg', [''])[0] or href
-                actual = up.unquote(actual)
-                if 'backstage.com' not in actual:
-                    continue
-                snip_el = div.find('a', class_='result__snippet')
-                snippet = snip_el.get_text(strip=True) if snip_el else ''
-                results.append((actual, snippet))
-            logger.debug(f"DDG found {len(results)} backstage URLs for: {query}")
-            return results
-        except Exception as e:
-            logger.debug(f"DDG search error: {e}")
-            return []
-
-    def _google_search(self, query: str) -> list:
-        """Google web search as fallback."""
-        import urllib.parse as up
-        search_url = 'https://www.google.com/search?q=' + up.quote(query) + '&num=20&hl=en'
-        try:
-            resp = requests.get(search_url, headers=self._SEARCH_HEADERS, timeout=20)
-            if resp.status_code != 200:
-                return []
-            soup = BeautifulSoup(resp.text, 'lxml')
-            results = []
-            for a in soup.find_all('a', href=True):
-                href = a['href']
-                if not href.startswith('/url?q='):
-                    continue
-                url = up.unquote(href[7:].split('&')[0])
-                if 'backstage.com/casting/' not in url:
-                    continue
-                parent  = a.find_parent(['div', 'li'])
-                snippet = parent.get_text(separator=' ', strip=True)[:400] if parent else ''
-                results.append((url, snippet))
-            logger.debug(f"Google found {len(results)} backstage URLs for: {query}")
-            return results
-        except Exception as e:
-            logger.debug(f"Google search error: {e}")
-            return []
 
 
 # ── Main runner ───────────────────────────────────────────────────────────────
