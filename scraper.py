@@ -1126,25 +1126,43 @@ class BackstageScraper(BaseScraper):
     BASE_URL = 'https://www.backstage.com'
     country = 'UK'
 
-    # Magazine roundup articles list current castings and ARE server-side rendered
-    ARTICLE_SEARCH_QUERIES = [
-        'site:backstage.com/magazine now casting UK Europe 2026',
-        'site:backstage.com/magazine animation voiceover teen child UK 2026',
-        'site:backstage.com/magazine casting calls UK Europe 2026',
+    # Regex that matches individual casting detail pages
+    _DETAIL_RE = re.compile(r'backstage\.com/casting/[\w%-]+-\d+/?$')
+
+    # Backstage's own RSS/Atom feeds (plain XML, no bot detection)
+    BACKSTAGE_RSS = [
+        'https://www.backstage.com/magazine/feed/',
+        'https://www.backstage.com/feed/',
+        'https://www.backstage.com/rss',
+        'https://www.backstage.com/magazine/casting/feed/',
     ]
 
-    # Direct casting page queries (fallback)
-    CASTING_SEARCH_QUERIES = [
-        'backstage.com/casting teen youth child actor UK Europe 2026',
-        'backstage.com/casting voiceover animation youth 2026',
-        'backstage.com/casting 13 14 15 16 years UK Europe 2026',
-    ]
-
-    # Sitemaps to try
+    # Sitemap index locations
     SITEMAP_URLS = [
         'https://www.backstage.com/sitemap.xml',
         'https://www.backstage.com/sitemap_index.xml',
         'https://www.backstage.com/sitemap-0.xml',
+    ]
+
+    # News RSS feeds from search engines — these bypass bot detection entirely
+    NEWS_RSS = [
+        'https://news.google.com/rss/search?q=backstage.com+casting+UK&hl=en-GB&gl=GB&ceid=GB:en',
+        'https://news.google.com/rss/search?q=backstage.com+casting+teen+voiceover&hl=en-GB&gl=GB&ceid=GB:en',
+        'https://www.bing.com/news/search?q=backstage.com+casting+UK+teen&format=rss',
+    ]
+
+    # Known "Now Casting" roundup article URLs — always checked.
+    # These are SSR pages that list multiple casting calls.
+    # Add newer URLs here as you spot them.
+    KNOWN_ARTICLES = [
+        'https://www.backstage.com/magazine/article/animation-series-more-uk-casting-79752/',
+        'https://www.backstage.com/magazine/article/now-casting-feature-film-more-uk-casting-79486/',
+        'https://www.backstage.com/magazine/article/now-casting-a-crime-thriller-film-79739/',
+        'https://www.backstage.com/magazine/article/teen-castings-auditions-76213/',
+        'https://www.backstage.com/magazine/article/voiceover-casting-68077/',
+        'https://www.backstage.com/magazine/article/worldwide-now-casting-68027/',
+        'https://www.backstage.com/magazine/article/nationwide-casting-68006/',
+        'https://www.backstage.com/magazine/article/trending-casting-calls-79012/',
     ]
 
     _HDRS = {
@@ -1157,47 +1175,57 @@ class BackstageScraper(BaseScraper):
         'Accept-Language': 'en-US,en;q=0.9',
     }
 
-    # Regex that matches individual casting detail pages
-    _DETAIL_RE = re.compile(r'backstage\.com/casting/[\w%-]+-\d+/?$')
-
     # ── main entry point ──────────────────────────────────────────────────────
 
     def scrape(self) -> list:
-        casting_urls: dict = {}   # url → snippet (snippet may be empty string)
+        casting_urls: dict = {}   # url → snippet
 
-        # ── Strategy 1: XML sitemaps ─────────────────────────────────────────
-        logger.info("backstage.com: Strategy 1 — checking XML sitemaps")
-        sm_urls = self._sitemap_urls()
-        logger.info(f"backstage.com: sitemap yielded {len(sm_urls)} casting URLs")
+        # ── Strategy 1: Backstage's own RSS feed ─────────────────────────────
+        logger.info("backstage.com: Strategy 1 — Backstage RSS feeds")
+        for rss_url in self.BACKSTAGE_RSS:
+            urls = self._parse_rss(rss_url)
+            for u, snip in urls:
+                if self._DETAIL_RE.search(u):
+                    casting_urls.setdefault(u, snip)
+                elif '/magazine/article/' in u:
+                    links = self._extract_casting_links(u)
+                    for lnk in links:
+                        casting_urls.setdefault(lnk, '')
+            if casting_urls:
+                logger.info(f"backstage.com: RSS {rss_url} → {len(casting_urls)} casting URLs so far")
+
+        # ── Strategy 2: XML sitemap ───────────────────────────────────────────
+        logger.info("backstage.com: Strategy 2 — XML sitemaps")
+        sm_urls = self._sitemap_casting_urls()
+        logger.info(f"backstage.com: sitemap → {len(sm_urls)} casting URLs")
         for u in sm_urls:
             casting_urls.setdefault(u, '')
 
-        # ── Strategy 2: Magazine roundup articles ────────────────────────────
-        logger.info("backstage.com: Strategy 2 — magazine article search")
-        article_urls = set()
-        for query in self.ARTICLE_SEARCH_QUERIES:
-            found = self._search_urls(query, pattern=r'backstage\.com/magazine/article/')
-            logger.info(f"backstage.com: article query '{query[:50]}' → {len(found)} articles")
-            article_urls.update(found)
+        # ── Strategy 3: Google/Bing News RSS (bypasses bot detection) ────────
+        logger.info("backstage.com: Strategy 3 — News RSS feeds")
+        for rss_url in self.NEWS_RSS:
+            urls = self._parse_rss(rss_url)
+            logger.info(f"backstage.com: news RSS {rss_url} → {len(urls)} items")
+            for u, snip in urls:
+                if self._DETAIL_RE.search(u):
+                    casting_urls.setdefault(u, snip)
+                elif 'backstage.com/magazine/article/' in u:
+                    links = self._extract_casting_links(u)
+                    logger.info(f"backstage.com: news article → {len(links)} casting links")
+                    for lnk in links:
+                        casting_urls.setdefault(lnk, '')
 
-        logger.info(f"backstage.com: fetching {len(article_urls)} article pages for casting links")
-        for art_url in list(article_urls)[:10]:
-            links = self._extract_casting_links_from_article(art_url)
-            logger.info(f"backstage.com: article → {len(links)} casting links: {art_url}")
-            for u in links:
-                casting_urls.setdefault(u, '')
+        # ── Strategy 4: Known hardcoded roundup articles ──────────────────────
+        logger.info(f"backstage.com: Strategy 4 — {len(self.KNOWN_ARTICLES)} known articles")
+        for art_url in self.KNOWN_ARTICLES:
+            links = self._extract_casting_links(art_url)
+            logger.info(f"backstage.com: known article → {len(links)} links: {art_url}")
+            for lnk in links:
+                casting_urls.setdefault(lnk, '')
 
-        # ── Strategy 3: Search engines for casting pages directly ────────────
-        logger.info("backstage.com: Strategy 3 — direct casting search")
-        for query in self.CASTING_SEARCH_QUERIES:
-            found = self._search_urls_with_snippets(query, pattern=self._DETAIL_RE)
-            logger.info(f"backstage.com: casting query '{query[:50]}' → {len(found)} URLs")
-            for u, snip in found:
-                casting_urls.setdefault(u, snip or '')
+        logger.info(f"backstage.com: total {len(casting_urls)} unique casting URLs to process")
 
-        logger.info(f"backstage.com: total unique casting URLs to process: {len(casting_urls)}")
-
-        # ── Process every discovered URL ─────────────────────────────────────
+        # ── Process each discovered URL ───────────────────────────────────────
         castings = []
         for url, snippet in casting_urls.items():
             title = self._slug_to_title(url) + ' Casting'
@@ -1213,23 +1241,53 @@ class BackstageScraper(BaseScraper):
             enriched = self._enrich_backstage(casting)
             if enriched:
                 age_str = (f"{enriched['age_min']}-{enriched['age_max']}"
-                           if enriched.get('age_min') is not None else "age unknown")
+                           if enriched.get('age_min') is not None else "age?")
                 logger.info(f"backstage.com ✅ ADDED: {enriched['title']} ({age_str})")
                 castings.append(enriched)
             else:
                 logger.info(f"backstage.com ❌ filtered: {title}")
-
             if len(castings) >= 30:
                 break
 
-        logger.info(f"backstage.com: done — {len(castings)} castings passed all filters")
+        logger.info(f"backstage.com: done — {len(castings)} castings passed filters")
         return castings
 
-    # ── Strategy 1: sitemaps ──────────────────────────────────────────────────
+    # ── RSS parsing ───────────────────────────────────────────────────────────
 
-    def _sitemap_urls(self) -> set:
-        """Parse Backstage XML sitemaps and return /casting/slug-ID/ URLs."""
-        import urllib.parse as up
+    def _parse_rss(self, rss_url: str) -> list:
+        """Fetch an RSS/Atom feed and return [(url, snippet)] pairs."""
+        results = []
+        try:
+            resp = requests.get(rss_url, headers=self._HDRS, timeout=20)
+            logger.info(f"backstage.com: RSS {rss_url} → HTTP {resp.status_code}")
+            if resp.status_code != 200:
+                return results
+            soup = BeautifulSoup(resp.text, 'lxml')
+            # RSS 2.0: <item><link>url</link><description>...</description></item>
+            # Atom:    <entry><link href="url"/><summary>...</summary></entry>
+            for item in soup.find_all(['item', 'entry']):
+                link_el = item.find('link')
+                if link_el:
+                    url = (link_el.get_text(strip=True) or
+                           link_el.get('href', '') or
+                           link_el.get('url', ''))
+                else:
+                    url = ''
+                if not url or 'backstage.com' not in url:
+                    continue
+                snip_el = item.find(['description', 'summary', 'content'])
+                snippet = ''
+                if snip_el:
+                    raw = snip_el.get_text(separator=' ', strip=True)
+                    snippet = re.sub(r'<[^>]+>', ' ', raw)[:400]
+                results.append((url, snippet))
+        except Exception as e:
+            logger.info(f"backstage.com: RSS error {rss_url} — {e}")
+        return results
+
+    # ── Sitemap parsing ───────────────────────────────────────────────────────
+
+    def _sitemap_casting_urls(self) -> set:
         found = set()
         for sm_url in self.SITEMAP_URLS:
             try:
@@ -1237,7 +1295,6 @@ class BackstageScraper(BaseScraper):
                 logger.info(f"backstage.com: sitemap {sm_url} → HTTP {resp.status_code}")
                 if resp.status_code != 200:
                     continue
-                # Parse XML — find all <loc> tags
                 soup = BeautifulSoup(resp.text, 'lxml')
                 locs = soup.find_all('loc')
                 logger.info(f"backstage.com: sitemap has {len(locs)} <loc> entries")
@@ -1245,8 +1302,7 @@ class BackstageScraper(BaseScraper):
                     url = loc.get_text(strip=True)
                     if self._DETAIL_RE.search(url):
                         found.add(url)
-                    elif 'sitemap' in url.lower():
-                        # Sub-sitemap index — fetch it too
+                    elif 'sitemap' in url.lower() and url != sm_url:
                         try:
                             r2 = requests.get(url, headers=self._HDRS, timeout=15)
                             if r2.status_code == 200:
@@ -1258,15 +1314,15 @@ class BackstageScraper(BaseScraper):
                         except Exception:
                             pass
                 if found:
-                    break   # got something from this sitemap, skip the others
+                    break
             except Exception as e:
-                logger.info(f"backstage.com: sitemap error {sm_url} — {e}")
+                logger.info(f"backstage.com: sitemap error — {e}")
         return found
 
-    # ── Strategy 2: magazine articles ────────────────────────────────────────
+    # ── Article link extraction ───────────────────────────────────────────────
 
-    def _extract_casting_links_from_article(self, article_url: str) -> set:
-        """Fetch a Backstage magazine article page and extract /casting/ links."""
+    def _extract_casting_links(self, article_url: str) -> set:
+        """Fetch a Backstage magazine article and return all /casting/slug-ID links."""
         found = set()
         try:
             resp = requests.get(article_url, headers=self._HDRS, timeout=20)
@@ -1284,107 +1340,9 @@ class BackstageScraper(BaseScraper):
             logger.info(f"backstage.com: article fetch error — {e}")
         return found
 
-    # ── Strategy 3 helpers: search engines ───────────────────────────────────
-
-    def _search_urls(self, query: str, pattern: str) -> set:
-        """Search DDG/Bing/Google and return URLs matching pattern (no snippets)."""
-        results = self._search_with_snippets(query)
-        pat = re.compile(pattern)
-        return {url for url, _ in results if pat.search(url)}
-
-    def _search_urls_with_snippets(self, query: str, pattern) -> list:
-        """Search and return [(url, snippet)] matching the given compiled pattern."""
-        results = self._search_with_snippets(query)
-        return [(url, snip) for url, snip in results if pattern.search(url)]
-
-    def _search_with_snippets(self, query: str) -> list:
-        """Try DDG → Bing → Google, return first non-empty [(url, snippet)]."""
-        for engine_fn, name in [
-            (self._ddg,    'DuckDuckGo'),
-            (self._bing,   'Bing'),
-            (self._google, 'Google'),
-        ]:
-            logger.info(f"backstage.com: searching {name} for: {query[:60]}")
-            try:
-                results = engine_fn(query)
-                logger.info(f"backstage.com: {name} returned {len(results)} results")
-                if results:
-                    return results
-            except Exception as e:
-                logger.info(f"backstage.com: {name} error — {e}")
-        return []
-
-    def _ddg(self, query: str) -> list:
-        import urllib.parse as up
-        url = 'https://html.duckduckgo.com/html/?q=' + up.quote(query)
-        resp = requests.get(url, headers=self._HDRS, timeout=20)
-        logger.info(f"backstage.com: DDG HTTP {resp.status_code}")
-        if resp.status_code != 200:
-            return []
-        soup = BeautifulSoup(resp.text, 'lxml')
-        results = []
-        for div in soup.find_all('div', class_='result'):
-            a = div.find('a', class_='result__a')
-            if not a:
-                continue
-            href = a.get('href', '')
-            parsed = up.urlparse(href)
-            qs = up.parse_qs(parsed.query)
-            actual = qs.get('uddg', [''])[0] or href
-            actual = up.unquote(actual)
-            if 'backstage.com' not in actual:
-                continue
-            snip_el = div.find('a', class_='result__snippet')
-            snippet = snip_el.get_text(strip=True) if snip_el else ''
-            results.append((actual, snippet))
-        return results
-
-    def _bing(self, query: str) -> list:
-        import urllib.parse as up
-        url = 'https://www.bing.com/search?q=' + up.quote(query) + '&count=20'
-        resp = requests.get(url, headers=self._HDRS, timeout=20)
-        logger.info(f"backstage.com: Bing HTTP {resp.status_code}")
-        if resp.status_code != 200:
-            return []
-        soup = BeautifulSoup(resp.text, 'lxml')
-        results = []
-        for li in soup.find_all('li', class_='b_algo'):
-            a = li.find('a', href=True)
-            if not a:
-                continue
-            href = a['href']
-            if 'backstage.com' not in href:
-                continue
-            snip_el = li.find('p') or li.find('div', class_='b_caption')
-            snippet = snip_el.get_text(strip=True) if snip_el else ''
-            results.append((href, snippet))
-        return results
-
-    def _google(self, query: str) -> list:
-        import urllib.parse as up
-        url = 'https://www.google.com/search?q=' + up.quote(query) + '&num=20&hl=en'
-        resp = requests.get(url, headers=self._HDRS, timeout=20)
-        logger.info(f"backstage.com: Google HTTP {resp.status_code}")
-        if resp.status_code != 200:
-            return []
-        soup = BeautifulSoup(resp.text, 'lxml')
-        results = []
-        for a in soup.find_all('a', href=True):
-            href = a['href']
-            if not href.startswith('/url?q='):
-                continue
-            actual = up.unquote(href[7:].split('&')[0])
-            if 'backstage.com' not in actual:
-                continue
-            parent = a.find_parent(['div', 'li'])
-            snippet = parent.get_text(separator=' ', strip=True)[:400] if parent else ''
-            results.append((actual, snippet))
-        return results
-
-    # ── enrich individual casting pages ───────────────────────────────────────
+    # ── Individual casting page enrichment ────────────────────────────────────
 
     def _enrich_backstage(self, casting: dict):
-        """Fetch a Backstage casting detail page and extract role data."""
         url     = casting['source_url']
         title   = casting['title']
         snippet = casting.get('description', '')
@@ -1394,8 +1352,8 @@ class BackstageScraper(BaseScraper):
         if not self._title_ok(title):
             return None
 
-        page_text   = ''
-        pdf_urls    = []
+        page_text = ''
+        pdf_urls  = []
         pdf_content = ''
 
         try:
@@ -1405,39 +1363,34 @@ class BackstageScraper(BaseScraper):
                 return None
             if resp.status_code == 200:
                 detail = BeautifulSoup(resp.text, 'lxml')
-
-                # Real title from h1
                 h1 = detail.find('h1')
                 if h1:
                     rt = h1.get_text(strip=True)
                     if len(rt) > 4:
                         casting['title'] = rt + ' Casting'
                         logger.info(f"backstage.com: title = {rt!r}")
-
                 content_el = (
                     detail.find('div', class_=re.compile(
                         r'content|entry|article|post-body|description|role|casting', re.I
                     )) or detail.find('article') or detail.find('main')
                 )
                 page_text = (content_el or detail).get_text(separator=' ', strip=True)[:4000]
-                logger.info(f"backstage.com: page_text={len(page_text)} chars, snippet={len(snippet)} chars")
-
+                logger.info(f"backstage.com: page={len(page_text)}ch snippet={len(snippet)}ch")
                 pdf_urls = find_pdf_links(detail, url)
                 for pu in pdf_urls[:3]:
                     txt = fetch_pdf_text(pu, url)
                     if txt:
                         pdf_content += f'\n--- PDF: {pu} ---\n{txt}'
         except Exception as e:
-            logger.info(f"backstage.com: detail fetch error — {e}")
+            logger.info(f"backstage.com: detail error — {e}")
 
         full_text = f"{casting['title']} {snippet} {page_text} {pdf_content}"
-
         if not full_text.strip():
             return None
 
         if not _is_open_casting(full_text):
             if not any(kw in full_text.lower() for kw in ('apply', 'audition', 'seeking', 'sought')):
-                logger.info(f"backstage.com: failed open-casting check: {casting['title']!r}")
+                logger.info(f"backstage.com: not open casting: {casting['title']!r}")
                 return None
 
         age_min, age_max = extract_age_range(full_text)
